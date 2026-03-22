@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Added quick model and thinking switches on the home screen and under each Codex reply.
+- Added a selected-models settings page so quick switching only cycles through your preferred models.
+- `/start` now always sends a fresh main menu message, and `Update bot` is always visible in Settings.
+
 ## 0.1.1
 
 - Added a dedicated model menu with quick switching for the active Codex model and thinking level.

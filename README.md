@@ -18,6 +18,7 @@ Built for a simple workflow:
 - project switching with `prev / next` and `All repos`
 - git branch switching with `prev / next` and `All branches`
 - model and thinking-level switching for Codex tasks
+- selected-model presets for quick switching
 - plain chat messages sent directly to Codex with streaming output
 - optional local Whisper transcription for Telegram voice messages
 - in-app bot update button with release notes after restart
@@ -106,6 +107,7 @@ WORKSPACES_ROOT=/Users/your-user/Developer
 ACTIVE_PROJECT_PATH=/Users/your-user/Developer/your-project
 CODEX_BIN=codex
 CODEX_MODEL=gpt-5.4
+CODEX_SELECTED_MODELS=gpt-5.4,gpt-5-codex-mini
 CODEX_THINKING_LEVEL=high
 COMMAND_TIMEOUT_SECONDS=900
 SHELL_TIMEOUT_SECONDS=120

@@ -11,6 +11,7 @@ DEFAULT_CONFIG_VALUES = {
     "ACTIVE_PROJECT_PATH": "",
     "CODEX_BIN": "codex",
     "CODEX_MODEL": "gpt-5.4",
+    "CODEX_SELECTED_MODELS": "gpt-5.4,gpt-5-codex-mini",
     "CODEX_THINKING_LEVEL": "high",
     "COMMAND_TIMEOUT_SECONDS": "900",
     "SHELL_TIMEOUT_SECONDS": "120",
@@ -45,6 +46,7 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
         "# Optional",
         f"CODEX_BIN={format_env_value(serialized['CODEX_BIN'])}",
         f"CODEX_MODEL={format_env_value(serialized['CODEX_MODEL'])}",
+        f"CODEX_SELECTED_MODELS={format_env_value(serialized['CODEX_SELECTED_MODELS'])}",
         f"CODEX_THINKING_LEVEL={format_env_value(serialized['CODEX_THINKING_LEVEL'])}",
         f"COMMAND_TIMEOUT_SECONDS={format_env_value(serialized['COMMAND_TIMEOUT_SECONDS'])}",
         f"SHELL_TIMEOUT_SECONDS={format_env_value(serialized['SHELL_TIMEOUT_SECONDS'])}",
@@ -152,11 +154,14 @@ def update_codex_preferences(
     path: Path,
     *,
     codex_model: str | None = None,
+    selected_models: list[str] | None = None,
     thinking_level: str | None = None,
 ) -> dict[str, str]:
     values = load_env_file(path)
     if codex_model is not None:
         values["CODEX_MODEL"] = codex_model.strip()
+    if selected_models is not None:
+        values["CODEX_SELECTED_MODELS"] = ",".join(item.strip() for item in selected_models if item.strip())
     if thinking_level is not None:
         values["CODEX_THINKING_LEVEL"] = thinking_level.strip()
     write_env_file(path, values)

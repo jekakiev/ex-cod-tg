@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,9 +21,6 @@ from bot.update_notice_store import clear_update_notice, load_update_notice
 BOT_COMMANDS = [
     BotCommand(command="start", description="Open the main menu"),
     BotCommand(command="help", description="Show available commands"),
-    BotCommand(command="status", description="Refresh the dashboard"),
-    BotCommand(command="model", description="Choose model and thinking"),
-    BotCommand(command="admins", description="Open admin management"),
     BotCommand(command="ask", description="Send a prompt to Codex"),
     BotCommand(command="fix", description="Ask Codex to fix something"),
     BotCommand(command="run", description="Run a safe shell command"),
@@ -97,12 +95,13 @@ async def _send_pending_update_notice(bot: Bot, notice_file: Path) -> None:
     if notice.notes:
         lines.append("")
         for note in notice.notes:
-            lines.append(f"• {note}")
+            lines.append(f"• {html.escape(note)}")
     text = "\n".join(lines)
     try:
         await bot.send_message(notice.chat_id, text)
-    finally:
         clear_update_notice(notice_file)
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to deliver post-update notice.")
 
 
 def main() -> None:

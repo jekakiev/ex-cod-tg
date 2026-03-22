@@ -42,13 +42,17 @@ from bot.ui import (
     build_codex_text,
     build_home_text,
     build_model_text,
+    build_selected_models_text,
     build_settings_text,
     build_voice_preview_text,
     build_whisper_text,
     build_workspaces_root_text,
     codex_keyboard,
     home_keyboard,
+    model_label,
     model_keyboard,
+    response_controls_keyboard,
+    selected_models_keyboard,
     settings_keyboard,
     voice_preview_keyboard,
     whisper_keyboard,
@@ -141,19 +145,16 @@ class AppContext:
 
 HELP_TEXT = """
 <b>Available commands</b>
-<code>/start</code> Open or refresh the main dashboard
+<code>/start</code> Open a fresh main menu message
 <code>/help</code> Show this help message
 <code>&lt;plain message&gt;</code> Chat with Codex in the active repository
 <code>&lt;voice message&gt;</code> Transcribe locally with Whisper, then approve before running Codex
-<code>/model</code> Open the model and thinking selector
 <code>/ask &lt;text&gt;</code> Send a prompt to the local Codex CLI
 <code>/fix &lt;task&gt;</code> Ask Codex to make a focused code fix
 <code>/run &lt;safe command&gt;</code> Run a restricted shell command
-<code>/status</code> Refresh the main dashboard
 <code>/diff</code> Show the current git diff
 <code>/commit &lt;message&gt;</code> Stage all changes and create a git commit
 <code>/log</code> Show the latest git commits
-<code>/admins</code> Open the admin management screen
 
 <b>Safe /run examples</b>
 <code>/run pwd</code>
@@ -187,7 +188,7 @@ async def start_command(message: Message, app_context: AppContext) -> None:
 
     await _sync_admin_label_from_message(message, app_context)
 
-    await _show_dashboard_from_message(message, app_context, page="home")
+    await _open_fresh_dashboard_from_message(message, app_context, page="home")
 
 
 @router.message(Command("help"))
@@ -532,12 +533,13 @@ async def codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContex
     if not await _ensure_authorized_callback(query, app_context):
         return
 
-    current_index = AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model) if app_context.config.codex_model in AVAILABLE_CODEX_MODELS else 0
+    models = _effective_selected_models(app_context)
+    current_index = models.index(app_context.config.codex_model) if app_context.config.codex_model in models else 0
     direction = -1 if query.data == "codexmodel:prev" else 1
-    next_model = AVAILABLE_CODEX_MODELS[(current_index + direction) % len(AVAILABLE_CODEX_MODELS)]
+    next_model = models[(current_index + direction) % len(models)]
     await _set_codex_preferences(app_context, codex_model=next_model)
     await _show_dashboard_from_callback(query, app_context, page="model")
-    await query.answer(f"Model: {next_model}")
+    await query.answer(f"Model: {model_label(next_model)}")
 
 
 @router.callback_query(F.data.in_({"thinking:prev", "thinking:next"}))
@@ -592,15 +594,16 @@ async def codexmodel_select_callback(query: CallbackQuery, app_context: AppConte
         await query.answer("Invalid model.", show_alert=True)
         return
 
+    models = _effective_selected_models(app_context)
     index = int(raw_index)
-    if index < 0 or index >= len(AVAILABLE_CODEX_MODELS):
+    if index < 0 or index >= len(models):
         await query.answer("Model list is out of date.", show_alert=True)
         return
 
-    target_model = AVAILABLE_CODEX_MODELS[index]
+    target_model = models[index]
     await _set_codex_preferences(app_context, codex_model=target_model)
     await _show_dashboard_from_callback(query, app_context, page="model")
-    await query.answer(f"Model: {target_model}")
+    await query.answer(f"Model: {model_label(target_model)}")
 
 
 @router.callback_query(F.data.startswith("thinking:select:"))
@@ -622,6 +625,55 @@ async def thinking_select_callback(query: CallbackQuery, app_context: AppContext
     await _set_codex_preferences(app_context, thinking_level=target_level)
     await _show_dashboard_from_callback(query, app_context, page="model")
     await query.answer(f"Thinking: {target_level}")
+
+
+@router.callback_query(F.data == "quick:model")
+async def quick_model_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    next_model = _cycle_current_model(app_context)
+    await _set_codex_preferences(app_context, codex_model=next_model)
+    await _refresh_quick_controls_target(query, app_context)
+    await query.answer(f"Model: {model_label(next_model)}")
+
+
+@router.callback_query(F.data == "quick:thinking")
+async def quick_thinking_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    next_level = _cycle_thinking_level(app_context)
+    await _set_codex_preferences(app_context, thinking_level=next_level)
+    await _refresh_quick_controls_target(query, app_context)
+    await query.answer(f"Thinking: {next_level}")
+
+
+@router.callback_query(F.data.startswith("selected_models:toggle:"))
+async def selected_models_toggle_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    target_model = query.data.rsplit(":", 1)[1]
+    if target_model not in AVAILABLE_CODEX_MODELS:
+        await query.answer("Unknown model.", show_alert=True)
+        return
+
+    selected = _effective_selected_models(app_context)
+    if target_model in selected:
+        if len(selected) == 1:
+            await query.answer("At least one model must stay selected.", show_alert=True)
+            return
+        selected = [model for model in selected if model != target_model]
+    else:
+        selected = [*selected, target_model]
+
+    current_model = app_context.config.codex_model
+    next_current_model = current_model if current_model in selected else selected[0]
+    await _set_codex_preferences(
+        app_context,
+        codex_model=next_current_model,
+        selected_models=selected,
+    )
+    await _show_dashboard_from_callback(query, app_context, page="selected_models")
+    await query.answer("Selected models updated.")
 
 
 @router.callback_query(F.data == "admin:add")
@@ -872,7 +924,7 @@ async def update_run_callback(query: CallbackQuery, app_context: AppContext) -> 
     update_state = await _get_bot_update_state(app_context, force=True)
     if not update_state.update_available:
         await _show_dashboard_from_callback(query, app_context, page="settings")
-        await query.answer("No update available.", show_alert=True)
+        await query.answer("You're already up to date.", show_alert=True)
         return
 
     old_commit = update_state.installed_commit
@@ -1080,6 +1132,24 @@ async def _get_bot_update_state(app_context: AppContext, *, force: bool = False)
     return update_state
 
 
+def _effective_selected_models(app_context: AppContext) -> list[str]:
+    selected = [model for model in app_context.config.codex_selected_models if model in AVAILABLE_CODEX_MODELS]
+    return selected or ["gpt-5.4", "gpt-5-codex-mini"]
+
+
+def _cycle_current_model(app_context: AppContext) -> str:
+    selected = _effective_selected_models(app_context)
+    current = app_context.config.codex_model
+    current_index = selected.index(current) if current in selected else 0
+    return selected[(current_index + 1) % len(selected)]
+
+
+def _cycle_thinking_level(app_context: AppContext) -> str:
+    current = app_context.config.codex_thinking_level
+    current_index = AVAILABLE_THINKING_LEVELS.index(current) if current in AVAILABLE_THINKING_LEVELS else 0
+    return AVAILABLE_THINKING_LEVELS[(current_index + 1) % len(AVAILABLE_THINKING_LEVELS)]
+
+
 def _active_project_index(app_context: AppContext, projects: list[WorkspaceProject]) -> int | None:
     for index, project in enumerate(projects):
         if project.path == app_context.config.working_dir:
@@ -1101,15 +1171,19 @@ async def _set_codex_preferences(
     app_context: AppContext,
     *,
     codex_model: str | None = None,
+    selected_models: list[str] | None = None,
     thinking_level: str | None = None,
 ) -> None:
     update_codex_preferences(
         app_context.config.config_file,
         codex_model=codex_model,
+        selected_models=selected_models,
         thinking_level=thinking_level,
     )
     if codex_model is not None:
         object.__setattr__(app_context.config, "codex_model", codex_model)
+    if selected_models is not None:
+        object.__setattr__(app_context.config, "codex_selected_models", tuple(selected_models))
     if thinking_level is not None:
         object.__setattr__(app_context.config, "codex_thinking_level", thinking_level)
 
@@ -1271,7 +1345,11 @@ async def _run_codex_chat_request(
         _render_streaming_message(
             body="Thinking…",
             finished=False,
-        )
+        ),
+        reply_markup=response_controls_keyboard(
+            current_model=app_context.config.codex_model,
+            current_thinking_level=app_context.config.codex_thinking_level,
+        ),
     )
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
@@ -1292,6 +1370,10 @@ async def _run_codex_chat_request(
                     body=result.final_text,
                     finished=True,
                 ),
+                reply_markup=response_controls_keyboard(
+                    current_model=app_context.config.codex_model,
+                    current_thinking_level=app_context.config.codex_thinking_level,
+                ),
             )
         else:
             await _edit_streaming_message(
@@ -1299,6 +1381,10 @@ async def _run_codex_chat_request(
                 _render_streaming_message(
                     body="Completed with no assistant text.",
                     finished=True,
+                ),
+                reply_markup=response_controls_keyboard(
+                    current_model=app_context.config.codex_model,
+                    current_thinking_level=app_context.config.codex_thinking_level,
                 ),
             )
     else:
@@ -1309,6 +1395,10 @@ async def _run_codex_chat_request(
                 body=error_text,
                 finished=True,
                 failed=True,
+            ),
+            reply_markup=response_controls_keyboard(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
             ),
         )
 
@@ -1403,6 +1493,10 @@ async def _execute_codex_chat_stream(
                 body=text or "Thinking…",
                 finished=False,
             ),
+            reply_markup=response_controls_keyboard(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
+            ),
         )
         last_edit_at = now
 
@@ -1429,6 +1523,19 @@ async def _show_dashboard_from_message(message: Message, app_context: AppContext
         app_context=app_context,
         chat_id=chat_id,
         user_id=user_id,
+        page=page,
+    )
+
+
+async def _open_fresh_dashboard_from_message(message: Message, app_context: AppContext, *, page: str) -> None:
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else chat_id
+    text, markup = await _render_page(app_context, page=page)
+    sent = await message.answer(text, reply_markup=markup)
+    app_context.dashboards[chat_id] = DashboardSession(
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=sent.message_id,
         page=page,
     )
 
@@ -1481,6 +1588,27 @@ async def _refresh_dashboard_for_chat(
     )
 
 
+async def _refresh_quick_controls_target(query: CallbackQuery, app_context: AppContext) -> None:
+    if query.message is None:
+        return
+
+    dashboard = app_context.dashboards.get(query.message.chat.id)
+    if dashboard and dashboard.message_id == query.message.message_id:
+        await _show_dashboard_from_callback(query, app_context, page="home")
+        return
+
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=response_controls_keyboard(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
+            )
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
 async def _edit_dashboard_message(
     message: Message,
     text: str,
@@ -1528,6 +1656,8 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             branch_names=branch_names,
             active_branch_index=active_branch_index,
             showing_branch_list=False,
+            current_model=app_context.config.codex_model,
+            current_thinking_level=app_context.config.codex_thinking_level,
         )
 
     if page == "repos":
@@ -1555,6 +1685,8 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 branch_names=branch_names,
                 active_branch_index=active_branch_index,
                 showing_branch_list=False,
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
             ),
         )
 
@@ -1583,6 +1715,8 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 branch_names=branch_names,
                 active_branch_index=active_branch_index,
                 showing_branch_list=True,
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
             ),
         )
 
@@ -1595,9 +1729,9 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 showing_thinking_list=False,
             ),
             model_keyboard(
-                models=AVAILABLE_CODEX_MODELS,
-                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
-                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                models=_effective_selected_models(app_context),
+                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
+                if app_context.config.codex_model in _effective_selected_models(app_context)
                 else None,
                 thinking_levels=AVAILABLE_THINKING_LEVELS,
                 active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
@@ -1617,9 +1751,9 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 showing_thinking_list=False,
             ),
             model_keyboard(
-                models=AVAILABLE_CODEX_MODELS,
-                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
-                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                models=_effective_selected_models(app_context),
+                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
+                if app_context.config.codex_model in _effective_selected_models(app_context)
                 else None,
                 thinking_levels=AVAILABLE_THINKING_LEVELS,
                 active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
@@ -1639,9 +1773,9 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 showing_thinking_list=True,
             ),
             model_keyboard(
-                models=AVAILABLE_CODEX_MODELS,
-                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
-                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                models=_effective_selected_models(app_context),
+                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
+                if app_context.config.codex_model in _effective_selected_models(app_context)
                 else None,
                 thinking_levels=AVAILABLE_THINKING_LEVELS,
                 active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
@@ -1664,8 +1798,17 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 workspaces_root=app_context.config.workspaces_root,
             ),
             settings_keyboard(
-                update_available=update_state.update_available,
                 update_busy=bool(app_context.queue.active_label and app_context.queue.active_label.startswith("bot update")),
+            ),
+        )
+
+    if page == "selected_models":
+        selected_models = _effective_selected_models(app_context)
+        return (
+            build_selected_models_text(selected_models=selected_models),
+            selected_models_keyboard(
+                available_models=AVAILABLE_CODEX_MODELS,
+                selected_models=selected_models,
             ),
         )
 
@@ -1735,6 +1878,8 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         branch_names=[],
         active_branch_index=None,
         showing_branch_list=False,
+        current_model=app_context.config.codex_model,
+        current_thinking_level=app_context.config.codex_thinking_level,
     )
 
 
@@ -1870,9 +2015,9 @@ def _render_streaming_message(
     return html.escape(clipped_body if finished or clipped_body else "Thinking…")
 
 
-async def _edit_streaming_message(message: Message, text: str) -> None:
+async def _edit_streaming_message(message: Message, text: str, reply_markup: Any | None = None) -> None:
     try:
-        await message.edit_text(text)
+        await message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise

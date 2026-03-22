@@ -39,6 +39,7 @@ class AppConfig:
     active_project_path: Path
     codex_bin: str
     codex_model: str
+    codex_selected_models: tuple[str, ...]
     codex_thinking_level: str
     command_timeout_seconds: int
     shell_timeout_seconds: int
@@ -65,6 +66,7 @@ class AppConfig:
             "WORKING_DIR",
             "CODEX_BIN",
             "CODEX_MODEL",
+            "CODEX_SELECTED_MODELS",
             "CODEX_THINKING_LEVEL",
             "COMMAND_TIMEOUT_SECONDS",
             "SHELL_TIMEOUT_SECONDS",
@@ -107,6 +109,10 @@ class AppConfig:
             active_project_path=active_project_path,
             codex_bin=merged_values.get("CODEX_BIN", "codex").strip() or "codex",
             codex_model=merged_values.get("CODEX_MODEL", default_codex_model).strip() or default_codex_model,
+            codex_selected_models=_parse_selected_models(
+                merged_values.get("CODEX_SELECTED_MODELS", ""),
+                fallback=(default_codex_model, "gpt-5-codex-mini"),
+            ),
             codex_thinking_level=merged_values.get("CODEX_THINKING_LEVEL", default_thinking_level).strip() or default_thinking_level,
             command_timeout_seconds=_parse_positive_int_from_values(
                 merged_values,
@@ -189,3 +195,8 @@ def _load_default_codex_preferences() -> tuple[str, str]:
     if isinstance(thinking, str) and thinking.strip():
         default_thinking = thinking.strip()
     return default_model, default_thinking
+
+
+def _parse_selected_models(raw_value: str, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    models = tuple(item.strip() for item in raw_value.split(",") if item.strip())
+    return models or fallback

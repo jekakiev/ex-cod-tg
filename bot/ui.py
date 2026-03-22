@@ -30,6 +30,15 @@ class PendingVoicePreview:
     source_label: str
 
 
+def model_label(value: str) -> str:
+    mapping = {
+        "gpt-5.4": "5.4",
+        "gpt-5-codex-mini": "5.4 mini",
+        "gpt-5": "5",
+    }
+    return mapping.get(value, value)
+
+
 def build_home_text(
     *,
     environment: EnvironmentStatus,
@@ -107,6 +116,8 @@ def home_keyboard(
     branch_names: list[str],
     active_branch_index: int | None,
     showing_branch_list: bool,
+    current_model: str,
+    current_thinking_level: str,
 ) -> InlineKeyboardMarkup:
     if showing_repo_list:
         rows: list[list[InlineKeyboardButton]] = []
@@ -176,8 +187,20 @@ def home_keyboard(
                 ),
                 InlineKeyboardButton(text="▶️", callback_data=branch_right_callback),
             ],
-            [InlineKeyboardButton(text="All repos", callback_data="repo:list")],
-            [InlineKeyboardButton(text="All branches", callback_data="branch:list")],
+            [
+                InlineKeyboardButton(text="All repos", callback_data="repo:list"),
+                InlineKeyboardButton(text="All branches", callback_data="branch:list"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Model: {model_label(current_model)}",
+                    callback_data="quick:model",
+                ),
+                InlineKeyboardButton(
+                    text=f"Thinking: {current_thinking_level}",
+                    callback_data="quick:thinking",
+                ),
+            ],
             [InlineKeyboardButton(text="Settings ⚙️", callback_data="nav:settings")],
         ]
     )
@@ -274,21 +297,51 @@ def build_settings_text(
     )
 
 
-def settings_keyboard(*, update_available: bool, update_busy: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(*, update_busy: bool) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="Admins", callback_data="nav:admins"),
             InlineKeyboardButton(text="Codex CLI", callback_data="nav:codex"),
         ],
         [InlineKeyboardButton(text="Model & Thinking", callback_data="nav:model")],
+        [InlineKeyboardButton(text="Selected models", callback_data="nav:selected_models")],
         [InlineKeyboardButton(text="Whisper", callback_data="nav:whisper")],
     ]
     if update_busy:
         rows.append([InlineKeyboardButton(text="⏳ Updating bot…", callback_data="update:noop")])
-    elif update_available:
+    else:
         rows.append([InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run")])
     rows.append([InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root")])
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")])
+    return _keyboard(rows)
+
+
+def build_selected_models_text(*, selected_models: list[str]) -> str:
+    lines = [
+        "<b>Selected models</b>",
+        "",
+        "Choose which models should be used in quick model switching.",
+        "",
+    ]
+    for model in selected_models:
+        lines.append(f"• <code>{html.escape(model_label(model))}</code>")
+    return "\n".join(lines)
+
+
+def selected_models_keyboard(*, available_models: list[str], selected_models: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    selected_set = set(selected_models)
+    for model in available_models:
+        prefix = "✅" if model in selected_set else "⬜️"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{prefix} {model_label(model)}",
+                    callback_data=f"selected_models:toggle:{model}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)
 
 
@@ -520,6 +573,23 @@ def voice_preview_keyboard(preview_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="✅ Approve", callback_data=f"voice:approve:{preview_id}"),
                 InlineKeyboardButton(text="❌ Cancel", callback_data=f"voice:cancel:{preview_id}"),
+            ]
+        ]
+    )
+
+
+def response_controls_keyboard(*, current_model: str, current_thinking_level: str) -> InlineKeyboardMarkup:
+    return _keyboard(
+        [
+            [
+                InlineKeyboardButton(
+                    text=f"Model: {model_label(current_model)}",
+                    callback_data="quick:model",
+                ),
+                InlineKeyboardButton(
+                    text=f"Thinking: {current_thinking_level}",
+                    callback_data="quick:thinking",
+                ),
             ]
         ]
     )
