@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -139,10 +140,20 @@ class CodexStreamAccumulator:
 
     @property
     def preview_text(self) -> str:
+        return self.preview_text_with_partial("")
+
+    def preview_text_with_partial(self, raw_buffer: str) -> str:
         assistant = self.assistant_text.strip()
+        reasoning = self.reasoning_text.strip()
+        partial_event = _parse_partial_codex_stream_event(raw_buffer)
+        if partial_event is not None:
+            if partial_event.kind == "reasoning":
+                reasoning = _merge_stream_text(reasoning, partial_event.text, is_delta=False).strip()
+            else:
+                assistant = _merge_stream_text(assistant, partial_event.text, is_delta=False).strip()
         if assistant:
             return assistant
-        return self.reasoning_text.strip()
+        return reasoning
 
 
 @dataclass(slots=True)
@@ -860,17 +871,24 @@ class CodexRunner:
         raw_stdout_parts: list[str] = []
         stdout_buffer = ""
         last_emit_at = 0.0
+        last_payload = ""
 
-        async def emit(force: bool = False) -> None:
+        async def emit(payload: str, force: bool = False) -> None:
             nonlocal last_emit_at
+            nonlocal last_payload
             if on_update is None:
                 return
-            now = time.monotonic()
-            if not force and now - last_emit_at < 0.8:
+            payload = payload.strip()
+            if not payload:
                 return
-            payload = stream_state.preview_text
+            now = time.monotonic()
+            if not force and payload == last_payload and now - last_emit_at < 1.5:
+                return
+            if not force and now - last_emit_at < 0.25:
+                return
             await on_update(payload)
             last_emit_at = now
+            last_payload = payload
 
         async def read_stderr() -> None:
             if process.stderr is None:
@@ -888,7 +906,7 @@ class CodexRunner:
             if process.stdout is not None:
                 while True:
                     chunk = await asyncio.wait_for(
-                        process.stdout.read(4096),
+                        process.stdout.read(512),
                         timeout=self.config.command_timeout_seconds,
                     )
                     if not chunk:
@@ -908,12 +926,16 @@ class CodexRunner:
                     for raw_line in complete_lines:
                         preview = stream_state.apply_raw_line(raw_line)
                         if preview:
-                            await emit()
+                            await emit(preview)
+
+                    partial_preview = stream_state.preview_text_with_partial(stdout_buffer)
+                    if partial_preview:
+                        await emit(partial_preview)
 
                 if stdout_buffer:
                     preview = stream_state.apply_raw_line(stdout_buffer)
                     if preview:
-                        await emit(force=True)
+                        await emit(preview, force=True)
             await asyncio.wait_for(process.wait(), timeout=self.config.command_timeout_seconds)
         except asyncio.TimeoutError:
             timed_out = True
@@ -962,7 +984,7 @@ class CodexRunner:
             duration_seconds=duration_seconds,
             timed_out=timed_out,
         )
-        await emit(force=True)
+        await emit(stream_state.preview_text, force=True)
         return CodexStreamResult(result=result, final_text=final_text)
 
     async def run_shell_command(self, args: list[str]) -> CommandResult:
@@ -1343,6 +1365,76 @@ def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
         text=joined,
         is_delta="delta" in normalized_event_type,
     )
+
+
+def _parse_partial_codex_stream_event(raw_buffer: str) -> CodexStreamEvent | None:
+    buffer = raw_buffer.replace("\x00", "").strip()
+    if not buffer.startswith("{"):
+        return None
+
+    normalized = buffer.lower()
+    if '"type":"agent_message"' in normalized:
+        kind = "assistant"
+    elif any(marker in normalized for marker in ('"type":"reasoning"', '"type":"summary"', '"type":"thinking"')):
+        kind = "reasoning"
+    else:
+        return None
+
+    marker = '"text":"'
+    marker_index = buffer.find(marker)
+    if marker_index < 0:
+        return None
+
+    fragment = _extract_partial_json_string_fragment(buffer[marker_index + len(marker) :])
+    if not fragment:
+        return None
+
+    decoded = _decode_partial_json_string_fragment(fragment)
+    if _is_low_value_stream_text(decoded):
+        return None
+
+    return CodexStreamEvent(kind=kind, text=decoded, is_delta=False)
+
+
+def _extract_partial_json_string_fragment(value: str) -> str:
+    chars: list[str] = []
+    escaped = False
+    for char in value:
+        if escaped:
+            chars.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            chars.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            break
+        chars.append(char)
+    return "".join(chars)
+
+
+def _decode_partial_json_string_fragment(fragment: str) -> str:
+    candidate = fragment
+    while candidate:
+        try:
+            return str(json.loads(f'"{candidate}"'))
+        except json.JSONDecodeError:
+            shortened = _trim_incomplete_json_escape(candidate)
+            if shortened != candidate:
+                candidate = shortened
+                continue
+            candidate = candidate[:-1]
+    return ""
+
+
+def _trim_incomplete_json_escape(value: str) -> str:
+    if value.endswith("\\"):
+        return value[:-1]
+    unicode_match = re.search(r"\\u[0-9a-fA-F]{0,3}$", value)
+    if unicode_match:
+        return value[: unicode_match.start()]
+    return value
 
 
 def _collect_text_fragments(value: Any, fragments: list[str]) -> None:

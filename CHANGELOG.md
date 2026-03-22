@@ -12,6 +12,7 @@
 - Added a macOS menu bar helper with bot status, start/stop controls, log access, and a launch-at-login toggle.
 - In-bot updates on macOS now hand off the final service reinstall to a separate launchd updater job so new helpers also appear after update.
 - Fixed the macOS tray helper startup crash and switched Codex streaming to chunk-based parsing so long JSON events do not break live replies.
+- Codex replies now surface partial text earlier from incomplete JSON chunks, and update progress stays below 100% until the restarted bot comes back online.
 
 ## 0.1.3
 

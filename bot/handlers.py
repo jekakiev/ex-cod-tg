@@ -1716,16 +1716,50 @@ async def _execute_codex_chat_stream(
     app_context: AppContext,
 ) -> Any:
     last_edit_at = 0.0
+    last_rendered_text = ""
+    preview_seen = False
+    spinner_stop = asyncio.Event()
+
+    async def spinner() -> None:
+        started_at = time.monotonic()
+        frame_index = 0
+        frames = ("Thinking", "Thinking.", "Thinking..", "Thinking...")
+        while not spinner_stop.is_set():
+            await asyncio.sleep(1.2)
+            if spinner_stop.is_set() or preview_seen:
+                continue
+            elapsed = int(time.monotonic() - started_at)
+            frame = frames[frame_index % len(frames)]
+            frame_index += 1
+            await _edit_streaming_message(
+                reply,
+                _render_streaming_message(
+                    body=f"{frame} {elapsed}s",
+                    finished=False,
+                ),
+                reply_markup=response_controls_keyboard(
+                    current_model=app_context.config.codex_model,
+                    current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
+                ),
+            )
 
     async def on_update(text: str) -> None:
         nonlocal last_edit_at
+        nonlocal last_rendered_text
+        nonlocal preview_seen
         now = time.monotonic()
-        if now - last_edit_at < 0.8:
+        text = text.strip()
+        if not text:
+            return
+        preview_seen = True
+        if text == last_rendered_text and now - last_edit_at < 1.5:
+            return
+        if now - last_edit_at < 0.25:
             return
         await _edit_streaming_message(
             reply,
             _render_streaming_message(
-                body=text or "Thinking…",
+                body=text,
                 finished=False,
             ),
             reply_markup=response_controls_keyboard(
@@ -1734,8 +1768,16 @@ async def _execute_codex_chat_stream(
             ),
         )
         last_edit_at = now
+        last_rendered_text = text
 
-    return await app_context.runner.run_codex_streaming_prompt(prompt, on_update=on_update)
+    spinner_task = asyncio.create_task(spinner())
+    try:
+        return await app_context.runner.run_codex_streaming_prompt(prompt, on_update=on_update)
+    finally:
+        spinner_stop.set()
+        spinner_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await spinner_task
 
 
 async def _show_dashboard_from_message(message: Message, app_context: AppContext, *, page: str) -> None:
@@ -2274,7 +2316,7 @@ async def _perform_bot_update(
             notes=progress.latest_notes,
         )
 
-        progress.percent = 100
+        progress.percent = 90
         progress.status_text = "Update installed. Restarting the service"
         await _refresh_dashboard_for_chat(
             bot=bot,
