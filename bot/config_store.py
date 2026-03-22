@@ -10,6 +10,8 @@ DEFAULT_CONFIG_VALUES = {
     "WORKSPACES_ROOT": "",
     "ACTIVE_PROJECT_PATH": "",
     "CODEX_BIN": "codex",
+    "CODEX_MODEL": "gpt-5.4",
+    "CODEX_THINKING_LEVEL": "high",
     "COMMAND_TIMEOUT_SECONDS": "900",
     "SHELL_TIMEOUT_SECONDS": "120",
     "GIT_TIMEOUT_SECONDS": "120",
@@ -42,6 +44,8 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
         "",
         "# Optional",
         f"CODEX_BIN={format_env_value(serialized['CODEX_BIN'])}",
+        f"CODEX_MODEL={format_env_value(serialized['CODEX_MODEL'])}",
+        f"CODEX_THINKING_LEVEL={format_env_value(serialized['CODEX_THINKING_LEVEL'])}",
         f"COMMAND_TIMEOUT_SECONDS={format_env_value(serialized['COMMAND_TIMEOUT_SECONDS'])}",
         f"SHELL_TIMEOUT_SECONDS={format_env_value(serialized['SHELL_TIMEOUT_SECONDS'])}",
         f"GIT_TIMEOUT_SECONDS={format_env_value(serialized['GIT_TIMEOUT_SECONDS'])}",
@@ -140,6 +144,21 @@ def update_workspace_settings(
         values["WORKSPACES_ROOT"] = str(workspaces_root.expanduser().resolve(strict=False))
     if active_project_path is not None:
         values["ACTIVE_PROJECT_PATH"] = str(active_project_path.expanduser().resolve(strict=False))
+    write_env_file(path, values)
+    return values
+
+
+def update_codex_preferences(
+    path: Path,
+    *,
+    codex_model: str | None = None,
+    thinking_level: str | None = None,
+) -> dict[str, str]:
+    values = load_env_file(path)
+    if codex_model is not None:
+        values["CODEX_MODEL"] = codex_model.strip()
+    if thinking_level is not None:
+        values["CODEX_THINKING_LEVEL"] = thinking_level.strip()
     write_env_file(path, values)
     return values
 

@@ -26,6 +26,7 @@ WHISPER_MODEL_NAME = "tiny"
 WHISPER_PIP_PACKAGE = "faster-whisper"
 SELF_REPO_URL = "git+https://github.com/jekakiev/ex-cod-tg.git"
 GITHUB_COMMITS_API = "https://api.github.com/repos/jekakiev/ex-cod-tg/commits/"
+RAW_GITHUB_BASE = "https://raw.githubusercontent.com/jekakiev/ex-cod-tg"
 
 
 @dataclass(slots=True)
@@ -109,7 +110,9 @@ class VoiceTranscriptionResult:
 class BotUpdateState:
     installed_commit: str | None
     latest_commit: str | None
+    latest_version: str | None
     latest_summary: str | None
+    latest_notes: list[str]
     update_available: bool
     check_ok: bool
     status_summary: str
@@ -254,13 +257,17 @@ class CodexRunner:
     async def collect_bot_update_state(self) -> BotUpdateState:
         installed_commit = self._read_installed_commit()
         latest_commit = await self._read_latest_remote_commit()
-        latest_summary = await self._read_remote_commit_summary(latest_commit) if latest_commit else None
+        latest_version = await self._read_remote_version(latest_commit) if latest_commit else None
+        latest_notes = await self._read_remote_release_notes(latest_commit, latest_version) if latest_commit and latest_version else []
+        latest_summary = latest_notes[0] if latest_notes else await self._read_remote_commit_summary(latest_commit) if latest_commit else None
 
         if latest_commit is None:
             return BotUpdateState(
                 installed_commit=installed_commit,
                 latest_commit=None,
+                latest_version=None,
                 latest_summary=None,
+                latest_notes=[],
                 update_available=False,
                 check_ok=False,
                 status_summary="Update check unavailable",
@@ -270,15 +277,16 @@ class CodexRunner:
         if installed_commit is None:
             status_summary = "Update check unavailable"
         elif update_available:
-            short_commit = latest_commit[:7]
-            status_summary = f"Update available ({short_commit})"
+            status_summary = f"Update available ({latest_version or latest_commit[:7]})"
         else:
-            status_summary = "Up to date"
+            status_summary = f"Up to date ({latest_version})" if latest_version else "Up to date"
 
         return BotUpdateState(
             installed_commit=installed_commit,
             latest_commit=latest_commit,
+            latest_version=latest_version,
             latest_summary=latest_summary,
+            latest_notes=latest_notes,
             update_available=update_available,
             check_ok=installed_commit is not None,
             status_summary=status_summary,
@@ -533,7 +541,7 @@ class CodexRunner:
             )
 
         return await self._run_process(
-            [self.config.codex_bin, prompt],
+            [self.config.codex_bin, "-m", self.config.codex_model, "-c", f'model_reasoning_effort="{self.config.codex_thinking_level}"', prompt],
             cwd=self.config.working_dir,
             timeout=self.config.command_timeout_seconds,
         )
@@ -576,6 +584,10 @@ class CodexRunner:
         args = [
             self.config.codex_bin,
             "exec",
+            "-m",
+            self.config.codex_model,
+            "-c",
+            f'model_reasoning_effort="{self.config.codex_thinking_level}"',
             "--json",
             "--color",
             "never",
@@ -875,6 +887,16 @@ class CodexRunner:
             return None
         return await asyncio.to_thread(self._fetch_remote_commit_summary, commit_sha)
 
+    async def _read_remote_version(self, commit_sha: str | None) -> str | None:
+        if not commit_sha:
+            return None
+        return await asyncio.to_thread(self._fetch_remote_version, commit_sha)
+
+    async def _read_remote_release_notes(self, commit_sha: str | None, version: str | None) -> list[str]:
+        if not commit_sha or not version:
+            return []
+        return await asyncio.to_thread(self._fetch_remote_release_notes, commit_sha, version)
+
     def _fetch_remote_commit_summary(self, commit_sha: str) -> str | None:
         request = urllib.request.Request(
             GITHUB_COMMITS_API + commit_sha,
@@ -891,6 +913,47 @@ class CodexRunner:
         if not isinstance(message, str):
             return None
         return message.strip().splitlines()[0].strip() or None
+
+    def _fetch_remote_version(self, commit_sha: str) -> str | None:
+        text = self._fetch_raw_text(commit_sha, "bot/version.py")
+        if not text:
+            return None
+        for line in text.splitlines():
+            if line.strip().startswith("APP_VERSION"):
+                _, _, value = line.partition("=")
+                cleaned = value.strip().strip('"').strip("'")
+                return cleaned or None
+        return None
+
+    def _fetch_remote_release_notes(self, commit_sha: str, version: str) -> list[str]:
+        text = self._fetch_raw_text(commit_sha, "CHANGELOG.md")
+        if not text:
+            return []
+        target_header = f"## {version}"
+        lines = text.splitlines()
+        capture = False
+        notes: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == target_header:
+                capture = True
+                continue
+            if capture and stripped.startswith("## "):
+                break
+            if capture and stripped.startswith("- "):
+                notes.append(stripped[2:].strip())
+        return notes
+
+    def _fetch_raw_text(self, commit_sha: str, relative_path: str) -> str | None:
+        request = urllib.request.Request(
+            f"{RAW_GITHUB_BASE}/{commit_sha}/{relative_path}",
+            headers={"User-Agent": "ex-cod-tg"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return response.read().decode("utf-8")
+        except (OSError, urllib.error.URLError, UnicodeDecodeError):
+            return None
 
     def _read_auth_file_metadata(self) -> tuple[str | None, str | None, str | None]:
         auth_file = self.codex_auth_file()

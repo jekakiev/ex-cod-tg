@@ -77,6 +77,28 @@ def build_home_text(
     return "".join(lines)
 
 
+def build_model_text(
+    *,
+    current_model: str,
+    current_thinking_level: str,
+    showing_model_list: bool,
+    showing_thinking_list: bool,
+) -> str:
+    lines = [
+        "<b>Model</b>",
+        "",
+        f"Selected model: <code>{html.escape(current_model)}</code>",
+        f"Thinking level: <code>{html.escape(current_thinking_level)}</code>",
+        "",
+        "These settings are used for new Codex tasks started from Telegram.",
+    ]
+    if showing_model_list:
+        lines.append("\n\nSelect the model below.")
+    elif showing_thinking_list:
+        lines.append("\n\nSelect the thinking level below.")
+    return "".join(lines)
+
+
 def home_keyboard(
     *,
     project_names: list[str],
@@ -161,6 +183,80 @@ def home_keyboard(
     )
 
 
+def model_keyboard(
+    *,
+    models: list[str],
+    active_model_index: int | None,
+    thinking_levels: list[str],
+    active_thinking_index: int | None,
+    showing_model_list: bool,
+    showing_thinking_list: bool,
+) -> InlineKeyboardMarkup:
+    if showing_model_list:
+        rows: list[list[InlineKeyboardButton]] = []
+        current_row: list[InlineKeyboardButton] = []
+        for index, model_name in enumerate(models):
+            current_row.append(
+                InlineKeyboardButton(
+                    text=_truncate_button_label(model_name, limit=24),
+                    callback_data=f"codexmodel:select:{index}",
+                )
+            )
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+        if current_row:
+            rows.append(current_row)
+        rows.append([InlineKeyboardButton(text="Back", callback_data="nav:model")])
+        return _keyboard(rows)
+
+    if showing_thinking_list:
+        rows = []
+        current_row = []
+        for index, level in enumerate(thinking_levels):
+            current_row.append(
+                InlineKeyboardButton(
+                    text=_truncate_button_label(level, limit=24),
+                    callback_data=f"thinking:select:{index}",
+                )
+            )
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+        if current_row:
+            rows.append(current_row)
+        rows.append([InlineKeyboardButton(text="Back", callback_data="nav:model")])
+        return _keyboard(rows)
+
+    has_models = bool(models) and active_model_index is not None
+    model_left = "codexmodel:prev" if has_models and len(models) > 1 else "codexmodel:noop"
+    model_right = "codexmodel:next" if has_models and len(models) > 1 else "codexmodel:noop"
+    model_label = models[active_model_index] if has_models else "Choose model"
+
+    has_thinking = bool(thinking_levels) and active_thinking_index is not None
+    thinking_left = "thinking:prev" if has_thinking and len(thinking_levels) > 1 else "thinking:noop"
+    thinking_right = "thinking:next" if has_thinking and len(thinking_levels) > 1 else "thinking:noop"
+    thinking_label = thinking_levels[active_thinking_index] if has_thinking else "Choose thinking"
+
+    return _keyboard(
+        [
+            [
+                InlineKeyboardButton(text="◀️", callback_data=model_left),
+                InlineKeyboardButton(text=_truncate_button_label(model_label, limit=24), callback_data="codexmodel:list"),
+                InlineKeyboardButton(text="▶️", callback_data=model_right),
+            ],
+            [
+                InlineKeyboardButton(text="◀️", callback_data=thinking_left),
+                InlineKeyboardButton(text=_truncate_button_label(thinking_label, limit=24), callback_data="thinking:list"),
+                InlineKeyboardButton(text="▶️", callback_data=thinking_right),
+            ],
+            [InlineKeyboardButton(text="All models", callback_data="codexmodel:list")],
+            [InlineKeyboardButton(text="All thinking", callback_data="thinking:list")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")],
+        ]
+    )
+
+
 def build_settings_text(
     *,
     auth_state: CodexAuthState,
@@ -184,6 +280,7 @@ def settings_keyboard(*, update_available: bool, update_busy: bool) -> InlineKey
             InlineKeyboardButton(text="Admins", callback_data="nav:admins"),
             InlineKeyboardButton(text="Codex CLI", callback_data="nav:codex"),
         ],
+        [InlineKeyboardButton(text="Model & Thinking", callback_data="nav:model")],
         [InlineKeyboardButton(text="Whisper", callback_data="nav:whisper")],
     ]
     if update_busy:

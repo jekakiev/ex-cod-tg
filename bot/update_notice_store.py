@@ -11,7 +11,8 @@ class UpdateNotice:
     user_id: int
     old_commit: str | None
     new_commit: str | None
-    summary: str | None
+    version: str | None
+    notes: list[str]
 
 
 def load_update_notice(path: Path) -> UpdateNotice | None:
@@ -27,7 +28,8 @@ def load_update_notice(path: Path) -> UpdateNotice | None:
             user_id=int(payload["user_id"]),
             old_commit=_string_or_none(payload.get("old_commit")),
             new_commit=_string_or_none(payload.get("new_commit")),
-            summary=_string_or_none(payload.get("summary")),
+            version=_string_or_none(payload.get("version")),
+            notes=_notes_list(payload.get("notes")),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -40,7 +42,8 @@ def save_update_notice(path: Path, notice: UpdateNotice) -> None:
         "user_id": notice.user_id,
         "old_commit": notice.old_commit,
         "new_commit": notice.new_commit,
-        "summary": notice.summary,
+        "version": notice.version,
+        "notes": notice.notes,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -57,3 +60,14 @@ def _string_or_none(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _notes_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = _string_or_none(item)
+        if text:
+            result.append(text)
+    return result

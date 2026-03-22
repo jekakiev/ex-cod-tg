@@ -19,7 +19,13 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from bot.codex_runner import AsyncCommandQueue, BotUpdateState, CodexRunner
-from bot.config_store import add_admin_id, remove_admin_id, save_admin_label, update_workspace_settings
+from bot.config_store import (
+    add_admin_id,
+    remove_admin_id,
+    save_admin_label,
+    update_codex_preferences,
+    update_workspace_settings,
+)
 from bot.update_notice_store import UpdateNotice, save_update_notice
 from bot.security import (
     SecurityError,
@@ -35,12 +41,14 @@ from bot.ui import (
     build_admins_text,
     build_codex_text,
     build_home_text,
+    build_model_text,
     build_settings_text,
     build_voice_preview_text,
     build_whisper_text,
     build_workspaces_root_text,
     codex_keyboard,
     home_keyboard,
+    model_keyboard,
     settings_keyboard,
     voice_preview_keyboard,
     whisper_keyboard,
@@ -58,6 +66,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 router = Router(name=__name__)
 UPDATE_CHECK_TTL_SECONDS = 120
+AVAILABLE_CODEX_MODELS = ["gpt-5.4", "gpt-5", "gpt-5-codex-mini"]
+AVAILABLE_THINKING_LEVELS = ["low", "medium", "high"]
 
 
 @dataclass(slots=True)
@@ -135,6 +145,7 @@ HELP_TEXT = """
 <code>/help</code> Show this help message
 <code>&lt;plain message&gt;</code> Chat with Codex in the active repository
 <code>&lt;voice message&gt;</code> Transcribe locally with Whisper, then approve before running Codex
+<code>/model</code> Open the model and thinking selector
 <code>/ask &lt;text&gt;</code> Send a prompt to the local Codex CLI
 <code>/fix &lt;task&gt;</code> Ask Codex to make a focused code fix
 <code>/run &lt;safe command&gt;</code> Run a restricted shell command
@@ -199,6 +210,13 @@ async def admins_command(message: Message, app_context: AppContext) -> None:
         return
     await _sync_admin_label_from_message(message, app_context)
     await _show_dashboard_from_message(message, app_context, page="admins")
+
+
+@router.message(Command("model"))
+async def model_command(message: Message, app_context: AppContext) -> None:
+    if not await _ensure_authorized_message(message, app_context):
+        return
+    await _show_dashboard_from_message(message, app_context, page="model")
 
 
 @router.message(Command("ask"))
@@ -403,6 +421,13 @@ async def repo_noop_callback(query: CallbackQuery, app_context: AppContext) -> N
     await query.answer()
 
 
+@router.callback_query(F.data.in_({"codexmodel:noop", "thinking:noop"}))
+async def model_noop_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    await query.answer()
+
+
 @router.callback_query(F.data == "repo:list")
 async def repo_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
@@ -416,6 +441,22 @@ async def branch_list_callback(query: CallbackQuery, app_context: AppContext) ->
     if not await _ensure_authorized_callback(query, app_context):
         return
     await _show_dashboard_from_callback(query, app_context, page="branches")
+    await query.answer()
+
+
+@router.callback_query(F.data == "codexmodel:list")
+async def codexmodel_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    await _show_dashboard_from_callback(query, app_context, page="models")
+    await query.answer()
+
+
+@router.callback_query(F.data == "thinking:list")
+async def thinking_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    await _show_dashboard_from_callback(query, app_context, page="thinking")
     await query.answer()
 
 
@@ -486,6 +527,36 @@ async def branch_cycle_callback(query: CallbackQuery, app_context: AppContext) -
         await query.answer((result.stderr or result.stdout or "Branch switch failed.")[:180], show_alert=True)
 
 
+@router.callback_query(F.data.in_({"codexmodel:prev", "codexmodel:next"}))
+async def codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+
+    current_index = AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model) if app_context.config.codex_model in AVAILABLE_CODEX_MODELS else 0
+    direction = -1 if query.data == "codexmodel:prev" else 1
+    next_model = AVAILABLE_CODEX_MODELS[(current_index + direction) % len(AVAILABLE_CODEX_MODELS)]
+    await _set_codex_preferences(app_context, codex_model=next_model)
+    await _show_dashboard_from_callback(query, app_context, page="model")
+    await query.answer(f"Model: {next_model}")
+
+
+@router.callback_query(F.data.in_({"thinking:prev", "thinking:next"}))
+async def thinking_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+
+    current_index = (
+        AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
+        if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+        else 0
+    )
+    direction = -1 if query.data == "thinking:prev" else 1
+    next_level = AVAILABLE_THINKING_LEVELS[(current_index + direction) % len(AVAILABLE_THINKING_LEVELS)]
+    await _set_codex_preferences(app_context, thinking_level=next_level)
+    await _show_dashboard_from_callback(query, app_context, page="model")
+    await query.answer(f"Thinking: {next_level}")
+
+
 @router.callback_query(F.data.startswith("branch:select:"))
 async def branch_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
@@ -509,6 +580,48 @@ async def branch_select_callback(query: CallbackQuery, app_context: AppContext) 
         await query.answer(f"Active branch: {target_branch}")
     else:
         await query.answer((result.stderr or result.stdout or "Branch switch failed.")[:180], show_alert=True)
+
+
+@router.callback_query(F.data.startswith("codexmodel:select:"))
+async def codexmodel_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+
+    raw_index = query.data.rsplit(":", 1)[1]
+    if not raw_index.isdigit():
+        await query.answer("Invalid model.", show_alert=True)
+        return
+
+    index = int(raw_index)
+    if index < 0 or index >= len(AVAILABLE_CODEX_MODELS):
+        await query.answer("Model list is out of date.", show_alert=True)
+        return
+
+    target_model = AVAILABLE_CODEX_MODELS[index]
+    await _set_codex_preferences(app_context, codex_model=target_model)
+    await _show_dashboard_from_callback(query, app_context, page="model")
+    await query.answer(f"Model: {target_model}")
+
+
+@router.callback_query(F.data.startswith("thinking:select:"))
+async def thinking_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+
+    raw_index = query.data.rsplit(":", 1)[1]
+    if not raw_index.isdigit():
+        await query.answer("Invalid thinking level.", show_alert=True)
+        return
+
+    index = int(raw_index)
+    if index < 0 or index >= len(AVAILABLE_THINKING_LEVELS):
+        await query.answer("Thinking list is out of date.", show_alert=True)
+        return
+
+    target_level = AVAILABLE_THINKING_LEVELS[index]
+    await _set_codex_preferences(app_context, thinking_level=target_level)
+    await _show_dashboard_from_callback(query, app_context, page="model")
+    await query.answer(f"Thinking: {target_level}")
 
 
 @router.callback_query(F.data == "admin:add")
@@ -764,7 +877,8 @@ async def update_run_callback(query: CallbackQuery, app_context: AppContext) -> 
 
     old_commit = update_state.installed_commit
     new_commit = update_state.latest_commit
-    summary = update_state.latest_summary
+    latest_version = update_state.latest_version
+    latest_notes = update_state.latest_notes
 
     await query.answer("Updating bot…")
     async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
@@ -788,13 +902,13 @@ async def update_run_callback(query: CallbackQuery, app_context: AppContext) -> 
         None,
     )
     await _schedule_post_update_notice(
-        query.bot,
         app_context,
         chat_id=query.message.chat.id,
         user_id=query.from_user.id,
         old_commit=old_commit,
         new_commit=new_commit,
-        summary=summary,
+        version=latest_version,
+        notes=latest_notes,
     )
     await app_context.runner.trigger_service_restart()
 
@@ -981,6 +1095,23 @@ async def _set_active_project(app_context: AppContext, project_path: Path) -> No
         active_project_path=resolved,
     )
     object.__setattr__(app_context.config, "active_project_path", resolved)
+
+
+async def _set_codex_preferences(
+    app_context: AppContext,
+    *,
+    codex_model: str | None = None,
+    thinking_level: str | None = None,
+) -> None:
+    update_codex_preferences(
+        app_context.config.config_file,
+        codex_model=codex_model,
+        thinking_level=thinking_level,
+    )
+    if codex_model is not None:
+        object.__setattr__(app_context.config, "codex_model", codex_model)
+    if thinking_level is not None:
+        object.__setattr__(app_context.config, "codex_thinking_level", thinking_level)
 
 
 async def _git_branches_for_active_project(app_context: AppContext) -> tuple[list[str], str | None]:
@@ -1455,6 +1586,72 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             ),
         )
 
+    if page == "model":
+        return (
+            build_model_text(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
+                showing_model_list=False,
+                showing_thinking_list=False,
+            ),
+            model_keyboard(
+                models=AVAILABLE_CODEX_MODELS,
+                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
+                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                else None,
+                thinking_levels=AVAILABLE_THINKING_LEVELS,
+                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
+                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                else None,
+                showing_model_list=False,
+                showing_thinking_list=False,
+            ),
+        )
+
+    if page == "models":
+        return (
+            build_model_text(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
+                showing_model_list=True,
+                showing_thinking_list=False,
+            ),
+            model_keyboard(
+                models=AVAILABLE_CODEX_MODELS,
+                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
+                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                else None,
+                thinking_levels=AVAILABLE_THINKING_LEVELS,
+                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
+                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                else None,
+                showing_model_list=True,
+                showing_thinking_list=False,
+            ),
+        )
+
+    if page == "thinking":
+        return (
+            build_model_text(
+                current_model=app_context.config.codex_model,
+                current_thinking_level=app_context.config.codex_thinking_level,
+                showing_model_list=False,
+                showing_thinking_list=True,
+            ),
+            model_keyboard(
+                models=AVAILABLE_CODEX_MODELS,
+                active_model_index=AVAILABLE_CODEX_MODELS.index(app_context.config.codex_model)
+                if app_context.config.codex_model in AVAILABLE_CODEX_MODELS
+                else None,
+                thinking_levels=AVAILABLE_THINKING_LEVELS,
+                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
+                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                else None,
+                showing_model_list=False,
+                showing_thinking_list=True,
+            ),
+        )
+
     if page == "settings":
         auth_state = await app_context.runner.collect_codex_auth_state()
         whisper_state = await app_context.runner.collect_whisper_state()
@@ -1620,22 +1817,22 @@ def _clear_pending_voice_requests_for_user(app_context: AppContext, user_id: int
 
 
 async def _schedule_post_update_notice(
-    bot: Bot,
     app_context: AppContext,
     *,
     chat_id: int,
     user_id: int,
     old_commit: str | None,
     new_commit: str | None,
-    summary: str | None,
+    version: str | None,
+    notes: list[str],
 ) -> None:
-    del bot  # kept for signature symmetry with caller context
     notice = UpdateNotice(
         chat_id=chat_id,
         user_id=user_id,
         old_commit=old_commit,
         new_commit=new_commit,
-        summary=summary,
+        version=version,
+        notes=notes,
     )
     save_update_notice(app_context.config.config_file.parent / "update_notice.json", notice)
 

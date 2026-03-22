@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +38,8 @@ class AppConfig:
     workspaces_root: Path
     active_project_path: Path
     codex_bin: str
+    codex_model: str
+    codex_thinking_level: str
     command_timeout_seconds: int
     shell_timeout_seconds: int
     git_timeout_seconds: int
@@ -61,6 +64,8 @@ class AppConfig:
             "ACTIVE_PROJECT_PATH",
             "WORKING_DIR",
             "CODEX_BIN",
+            "CODEX_MODEL",
+            "CODEX_THINKING_LEVEL",
             "COMMAND_TIMEOUT_SECONDS",
             "SHELL_TIMEOUT_SECONDS",
             "GIT_TIMEOUT_SECONDS",
@@ -70,6 +75,7 @@ class AppConfig:
             if env_value is not None and env_value.strip():
                 merged_values[key] = env_value
 
+        default_codex_model, default_thinking_level = _load_default_codex_preferences()
         telegram_bot_token = merged_values.get("TELEGRAM_BOT_TOKEN", "").strip()
         if not telegram_bot_token:
             raise ConfigError(f"TELEGRAM_BOT_TOKEN is required in {config_file}")
@@ -100,6 +106,8 @@ class AppConfig:
             workspaces_root=workspaces_root,
             active_project_path=active_project_path,
             codex_bin=merged_values.get("CODEX_BIN", "codex").strip() or "codex",
+            codex_model=merged_values.get("CODEX_MODEL", default_codex_model).strip() or default_codex_model,
+            codex_thinking_level=merged_values.get("CODEX_THINKING_LEVEL", default_thinking_level).strip() or default_thinking_level,
             command_timeout_seconds=_parse_positive_int_from_values(
                 merged_values,
                 "COMMAND_TIMEOUT_SECONDS",
@@ -163,3 +171,21 @@ def _parse_admin_labels(raw_value: str) -> dict[int, str]:
         except ValueError as exc:
             raise ConfigError(f"Invalid ADMIN_LABELS entry: {chunk!r}") from exc
     return result
+
+
+def _load_default_codex_preferences() -> tuple[str, str]:
+    config_path = Path.home() / ".codex" / "config.toml"
+    default_model = "gpt-5.4"
+    default_thinking = "high"
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return default_model, default_thinking
+
+    model = payload.get("model")
+    thinking = payload.get("model_reasoning_effort")
+    if isinstance(model, str) and model.strip():
+        default_model = model.strip()
+    if isinstance(thinking, str) and thinking.strip():
+        default_thinking = thinking.strip()
+    return default_model, default_thinking

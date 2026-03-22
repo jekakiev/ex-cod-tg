@@ -17,8 +17,10 @@ Built for a simple workflow:
 - convenient auto-updating Telegram menu
 - project switching with `prev / next` and `All repos`
 - git branch switching with `prev / next` and `All branches`
+- model and thinking-level switching for Codex tasks
 - plain chat messages sent directly to Codex with streaming output
 - optional local Whisper transcription for Telegram voice messages
+- in-app bot update button with release notes after restart
 - built-in commands: `/ask`, `/fix`, `/diff`, `/log`, `/commit`, `/run`
 - Codex CLI auth screen with login, logout, and refresh
 - automatic first-admin bootstrap on the first `/start`
@@ -67,6 +69,7 @@ The only thing you need to enter in the terminal is your Telegram bot token.
 - `/start` — open the main dashboard
 - `/help` — show help
 - `/status` — refresh the dashboard
+- `/model` — choose the Codex model and thinking level
 - `/admins` — open admin management
 - `/ask <text>` — send a prompt to Codex
 - `/fix <task>` — ask Codex to fix something
@@ -102,6 +105,8 @@ ADMIN_IDS=
 WORKSPACES_ROOT=/Users/your-user/Developer
 ACTIVE_PROJECT_PATH=/Users/your-user/Developer/your-project
 CODEX_BIN=codex
+CODEX_MODEL=gpt-5.4
+CODEX_THINKING_LEVEL=high
 COMMAND_TIMEOUT_SECONDS=900
 SHELL_TIMEOUT_SECONDS=120
 GIT_TIMEOUT_SECONDS=120

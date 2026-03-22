@@ -80,6 +80,8 @@ def prompt_for_config(existing: dict[str, str], *, default_working_dir: Path) ->
         "WORKSPACES_ROOT": str(workspaces_root),
         "ACTIVE_PROJECT_PATH": str(active_project),
         "CODEX_BIN": existing.get("CODEX_BIN", "").strip() or "codex",
+        "CODEX_MODEL": existing.get("CODEX_MODEL", "").strip() or "gpt-5.4",
+        "CODEX_THINKING_LEVEL": existing.get("CODEX_THINKING_LEVEL", "").strip() or "high",
         "COMMAND_TIMEOUT_SECONDS": "900",
         "SHELL_TIMEOUT_SECONDS": "120",
         "GIT_TIMEOUT_SECONDS": "120",

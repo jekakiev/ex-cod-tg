@@ -21,6 +21,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Open the main menu"),
     BotCommand(command="help", description="Show available commands"),
     BotCommand(command="status", description="Refresh the dashboard"),
+    BotCommand(command="model", description="Choose model and thinking"),
     BotCommand(command="admins", description="Open admin management"),
     BotCommand(command="ask", description="Send a prompt to Codex"),
     BotCommand(command="fix", description="Ask Codex to fix something"),
@@ -89,14 +90,15 @@ async def _send_pending_update_notice(bot: Bot, notice_file: Path) -> None:
     if notice is None:
         return
 
-    summary = notice.summary or "A new bot update was installed."
     old_commit = notice.old_commit[:7] if notice.old_commit else "unknown"
     new_commit = notice.new_commit[:7] if notice.new_commit else "unknown"
-    text = (
-        "<b>Bot updated</b>\n\n"
-        f"{summary}\n"
-        f"Commit: <code>{old_commit}</code> → <code>{new_commit}</code>"
-    )
+    title = f"<b>Bot updated to {notice.version}</b>" if notice.version else "<b>Bot updated</b>"
+    lines = [title, "", f"Commit: <code>{old_commit}</code> → <code>{new_commit}</code>"]
+    if notice.notes:
+        lines.append("")
+        for note in notice.notes:
+            lines.append(f"• {note}")
+    text = "\n".join(lines)
     try:
         await bot.send_message(notice.chat_id, text)
     finally:
