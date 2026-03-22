@@ -79,8 +79,7 @@ def build_home_text(
     if whisper_summary:
         lines.insert(-1, f"Whisper: <code>{html.escape(whisper_summary)}</code>\n")
     if update_state.update_available:
-        summary = update_state.latest_summary or "A newer commit is available."
-        lines.append(f'\n\n<blockquote>Update available: {html.escape(summary)}</blockquote>')
+        lines.append('\n\n<blockquote>Update available. Open Settings to update the bot.</blockquote>')
     if showing_repo_list:
         lines.append("\nSelect the repository to use below.")
     elif showing_branch_list:

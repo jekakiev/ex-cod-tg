@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 if TYPE_CHECKING:
     from bot.config import AppConfig
 
+from bot.version import APP_VERSION
+
 
 logger = logging.getLogger(__name__)
 WHISPER_MODEL_NAME = "tiny"
@@ -311,8 +313,11 @@ class CodexRunner:
         installed_commit = self._read_installed_commit()
         latest_commit = await self._read_latest_remote_commit()
         latest_version = await self._read_remote_version(latest_commit) if latest_commit else None
+        remote_commit_summary = await self._read_remote_commit_summary(latest_commit) if latest_commit else None
         latest_notes = await self._read_remote_release_notes(latest_commit, latest_version) if latest_commit and latest_version else []
-        latest_summary = latest_notes[0] if latest_notes else await self._read_remote_commit_summary(latest_commit) if latest_commit else None
+        if latest_version and latest_version == APP_VERSION and remote_commit_summary:
+            latest_notes = [remote_commit_summary]
+        latest_summary = latest_notes[0] if latest_notes else remote_commit_summary
 
         if latest_commit is None:
             return BotUpdateState(
