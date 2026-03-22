@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$PROJECT_ROOT/.venv"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+PROJECT_FILE="$PROJECT_ROOT/pyproject.toml"
+STAMP_FILE="$VENV_DIR/.install.sha256"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python not found: $PYTHON_BIN" >&2
+  echo "Install Python 3.11+ and try again." >&2
+  exit 1
+fi
+
+if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+  echo "Python 3.11+ is required." >&2
+  "$PYTHON_BIN" -c 'import sys; print("Detected:", sys.version.split()[0])'
+  exit 1
+fi
+
+if [[ ! -d "$VENV_DIR" ]]; then
+  echo "Creating virtual environment..."
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+
+VENV_PYTHON="$VENV_DIR/bin/python"
+VENV_PIP="$VENV_DIR/bin/pip"
+CURRENT_HASH="$(shasum -a 256 "$PROJECT_FILE" | awk '{print $1}')"
+INSTALLED_HASH=""
+
+if [[ -f "$STAMP_FILE" ]]; then
+  INSTALLED_HASH="$(cat "$STAMP_FILE")"
+fi
+
+if [[ "$CURRENT_HASH" != "$INSTALLED_HASH" ]]; then
+  echo "Installing package..."
+  "$VENV_PIP" install -e "$PROJECT_ROOT"
+  printf '%s\n' "$CURRENT_HASH" > "$STAMP_FILE"
+fi
+
+if [[ "${1:-}" == "--configure" ]]; then
+  shift
+  exec "$VENV_DIR/bin/ex-cod-tg" configure "$@"
+fi
+
+echo "Starting ex-cod-tg..."
+exec "$VENV_DIR/bin/ex-cod-tg" "$@"

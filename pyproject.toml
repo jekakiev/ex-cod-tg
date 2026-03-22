@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ex-cod-tg"
+version = "0.1.0"
+description = "Telegram bridge for a local Codex CLI on macOS and Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiogram>=3.13,<4.0",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[project.scripts]
+ex-cod-tg = "bot.cli:main"
+
+[tool.setuptools]
+packages = ["bot", "utils"]
