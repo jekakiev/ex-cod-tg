@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import importlib.metadata
 import json
 import logging
@@ -880,6 +881,7 @@ class CodexRunner:
         stream_state = CodexStreamAccumulator()
         raw_stdout_parts: list[str] = []
         stdout_buffer = ""
+        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         last_emit_at = 0.0
         last_payload = ""
 
@@ -921,7 +923,7 @@ class CodexRunner:
                     )
                     if not chunk:
                         break
-                    decoded_chunk = chunk.decode("utf-8", errors="replace")
+                    decoded_chunk = stdout_decoder.decode(chunk, final=False)
                     raw_stdout_parts.append(decoded_chunk)
                     stdout_buffer += decoded_chunk
 
@@ -945,6 +947,10 @@ class CodexRunner:
                     if partial_preview:
                         await emit(partial_preview)
 
+                trailing_chunk = stdout_decoder.decode(b"", final=True)
+                if trailing_chunk:
+                    raw_stdout_parts.append(trailing_chunk)
+                    stdout_buffer += trailing_chunk
                 if stdout_buffer:
                     preview = stream_state.apply_raw_line(stdout_buffer)
                     if preview:
@@ -1034,17 +1040,6 @@ class CodexRunner:
             timeout=timeout or self.config.git_timeout_seconds,
             log_command=log_command,
         )
-
-    async def run_commit(self, message: str) -> list[tuple[str, CommandResult]]:
-        staged = await self.run_git_command(["add", "-A"], timeout=60)
-        if not staged.ok:
-            return [("git add -A", staged)]
-
-        committed = await self.run_git_command(
-            ["commit", "-m", message],
-            timeout=self.config.command_timeout_seconds,
-        )
-        return [("git add -A", staged), ("git commit", committed)]
 
     async def run_codex_logout(self) -> CommandResult:
         return await self._run_process(

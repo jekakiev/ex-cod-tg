@@ -527,7 +527,8 @@ def response_controls_keyboard(*, current_model: str, current_thinking_level: st
                     text=f"Thinking: {thinking_label(current_thinking_level)}",
                     callback_data="quick:thinking",
                 ),
-            ]
+            ],
+            [InlineKeyboardButton(text="🏠 Головне меню", callback_data="nav:main_menu")],
         ]
     )
 

@@ -21,11 +21,8 @@ from bot.update_notice_store import clear_update_notice, load_update_notice
 BOT_COMMANDS = [
     BotCommand(command="start", description="Open the main menu"),
     BotCommand(command="help", description="Show available commands"),
-    BotCommand(command="ask", description="Send a prompt to Codex"),
-    BotCommand(command="fix", description="Ask Codex to fix something"),
     BotCommand(command="run", description="Run a safe shell command"),
     BotCommand(command="diff", description="Show the current git diff"),
-    BotCommand(command="commit", description="Create a git commit"),
     BotCommand(command="log", description="Show recent git commits"),
 ]
 

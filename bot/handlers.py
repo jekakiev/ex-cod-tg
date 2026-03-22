@@ -207,12 +207,13 @@ HELP_TEXT = """
 <code>&lt;plain message&gt;</code> Chat with Codex in the active repository
 <code>&lt;photo/image file&gt;</code> Send with a caption, or send text next to use it as input for Codex
 <code>&lt;voice message&gt;</code> Transcribe locally with Whisper, then approve before running Codex
-<code>/ask &lt;text&gt;</code> Send a prompt to the local Codex CLI
-<code>/fix &lt;task&gt;</code> Ask Codex to make a focused code fix
 <code>/run &lt;safe command&gt;</code> Run a restricted shell command
 <code>/diff</code> Show the current git diff
-<code>/commit &lt;message&gt;</code> Stage all changes and create a git commit
 <code>/log</code> Show the latest git commits
+
+<b>Tip</b>
+You do not need a slash command for most Codex tasks.
+If you want Codex to fix, refactor, explain, or commit something, just send it as a normal chat message.
 
 <b>Safe /run examples</b>
 <code>/run pwd</code>
@@ -254,73 +255,6 @@ async def help_command(message: Message, app_context: AppContext) -> None:
     if not await _ensure_authorized_message(message, app_context):
         return
     await message.answer(HELP_TEXT)
-
-
-@router.message(Command("ask"))
-async def ask_command(message: Message, command: CommandObject, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-
-    prompt = (command.args or "").strip()
-    if not prompt:
-        await message.answer("Usage: <code>/ask explain the failing test</code>")
-        return
-
-    user_id = message.from_user.id if message.from_user else None
-    logger.info("Telegram /ask from %s: %s", user_id, prompt[:500])
-
-    result = await _run_serialized(
-        message=message,
-        app_context=app_context,
-        label=f"/ask by {user_id}",
-        task_factory=lambda: app_context.runner.run_codex_prompt(prompt),
-    )
-    await _send_result_chunks(
-        message,
-        format_command_results(
-            title="Codex /ask",
-            named_results=[("codex", result)],
-            max_output_chars=app_context.config.max_output_chars,
-        ),
-    )
-
-
-@router.message(Command("fix"))
-async def fix_command(message: Message, command: CommandObject, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-
-    task = (command.args or "").strip()
-    if not task:
-        await message.answer("Usage: <code>/fix update the failing parser tests</code>")
-        return
-
-    user_id = message.from_user.id if message.from_user else None
-    logger.info("Telegram /fix from %s: %s", user_id, task[:500])
-
-    prompt = (
-        "You are operating through a Telegram bridge on the user's macOS machine. "
-        f"The repository root is {app_context.config.working_dir}. "
-        "Make the smallest safe production-ready change to solve the task below. "
-        "Run relevant checks if possible, avoid unnecessary edits, and end with a short summary.\n\n"
-        f"Task: {task}"
-    )
-
-    result = await _run_serialized(
-        message=message,
-        app_context=app_context,
-        label=f"/fix by {user_id}",
-        task_factory=lambda: app_context.runner.run_codex_prompt(prompt),
-    )
-    await _send_result_chunks(
-        message,
-        format_command_results(
-            title="Codex /fix",
-            named_results=[("codex", result)],
-            max_output_chars=app_context.config.max_output_chars,
-        ),
-    )
-
 
 @router.message(Command("run"))
 async def run_command(message: Message, command: CommandObject, app_context: AppContext) -> None:
@@ -385,35 +319,6 @@ async def diff_command(message: Message, app_context: AppContext) -> None:
     )
 
 
-@router.message(Command("commit"))
-async def commit_command(message: Message, command: CommandObject, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-
-    commit_message = (command.args or "").strip()
-    if not commit_message:
-        await message.answer("Usage: <code>/commit fix login race condition</code>")
-        return
-
-    user_id = message.from_user.id if message.from_user else None
-    logger.info("Telegram /commit from %s: %s", user_id, commit_message[:200])
-
-    results = await _run_serialized(
-        message=message,
-        app_context=app_context,
-        label=f"/commit by {user_id}",
-        task_factory=lambda: app_context.runner.run_commit(commit_message),
-    )
-    await _send_result_chunks(
-        message,
-        format_command_results(
-            title="Git /commit",
-            named_results=results,
-            max_output_chars=app_context.config.max_output_chars,
-        ),
-    )
-
-
 @router.message(Command("log"))
 async def log_command(message: Message, app_context: AppContext) -> None:
     if not await _ensure_authorized_message(message, app_context):
@@ -451,6 +356,16 @@ async def navigation_callback(query: CallbackQuery, app_context: AppContext) -> 
         return
 
     page = query.data.split(":", 1)[1]
+    if page == "main_menu":
+        await query.answer()
+        await send_fresh_dashboard_for_chat(
+            bot=query.bot,
+            app_context=app_context,
+            chat_id=query.message.chat.id,
+            user_id=query.from_user.id if query.from_user else query.message.chat.id,
+            page="home",
+        )
+        return
     if page in {"model", "models", "thinking"}:
         page = "home"
     elif page == "whisper":
@@ -1115,6 +1030,12 @@ async def generic_message_handler(message: Message, app_context: AppContext) -> 
         return
 
     if text.startswith("/"):
+        command_name = text.split(maxsplit=1)[0].lower()
+        if command_name in {"/ask", "/fix", "/commit"}:
+            await message.answer(
+                "This shortcut was removed. Send the same request as a normal chat message instead."
+            )
+            return
         await message.answer("Unknown command. Use /help or send a plain message for Codex.")
         return
 
@@ -1708,17 +1629,16 @@ async def _run_codex_chat_request_native(
 ) -> None:
     draft_id = _build_stream_draft_id(message)
 
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-        result = await app_context.queue.submit(
-            f"chat by {user_id}",
-            lambda: _execute_codex_chat_stream_native(
-                message=message,
-                draft_id=draft_id,
-                prompt=prompt,
-                app_context=app_context,
-                image_paths=image_paths,
-            ),
-        )
+    result = await app_context.queue.submit(
+        f"chat by {user_id}",
+        lambda: _execute_codex_chat_stream_native(
+            message=message,
+            draft_id=draft_id,
+            prompt=prompt,
+            app_context=app_context,
+            image_paths=image_paths,
+        ),
+    )
 
     current_thinking_level = _effective_thinking_level(app_context, app_context.config.codex_model)
     markup = response_controls_keyboard(
@@ -1905,16 +1825,37 @@ async def _execute_codex_chat_stream_native(
     last_rendered_text = ""
     preview_seen = False
     spinner_stop = asyncio.Event()
+    current_draft_text = ""
+    keepalive_tick = 0
+    last_draft_sent_at = 0.0
 
-    async def update_draft(text: str) -> None:
+    async def update_draft(text: str, *, keepalive: bool = False) -> None:
+        nonlocal current_draft_text
+        nonlocal keepalive_tick
+        nonlocal last_draft_sent_at
+        current_draft_text = text
+        if keepalive:
+            keepalive_tick += 1
         try:
             await message.bot.send_message_draft(
                 chat_id=message.chat.id,
                 draft_id=draft_id,
-                text=_render_draft_stream_message(text),
+                text=_render_draft_stream_message(text, heartbeat_tick=keepalive_tick if keepalive else 0),
             )
+            last_draft_sent_at = time.monotonic()
         except Exception:
             logger.exception("Failed to send Telegram draft update")
+
+    async def keepalive() -> None:
+        while not spinner_stop.is_set():
+            await asyncio.sleep(1.4)
+            if spinner_stop.is_set():
+                return
+            if not current_draft_text:
+                continue
+            if time.monotonic() - last_draft_sent_at < 1.1:
+                continue
+            await update_draft(current_draft_text, keepalive=True)
 
     async def spinner() -> None:
         started_at = time.monotonic()
@@ -1953,7 +1894,9 @@ async def _execute_codex_chat_stream_native(
         last_edit_at = now
         last_rendered_text = text
 
+    await update_draft("Thinking…")
     spinner_task = asyncio.create_task(spinner())
+    keepalive_task = asyncio.create_task(keepalive())
     try:
         return await app_context.runner.run_codex_streaming_prompt(
             prompt,
@@ -1963,8 +1906,11 @@ async def _execute_codex_chat_stream_native(
     finally:
         spinner_stop.set()
         spinner_task.cancel()
+        keepalive_task.cancel()
         with suppress(asyncio.CancelledError):
             await spinner_task
+        with suppress(asyncio.CancelledError):
+            await keepalive_task
 
 
 async def _handle_image_message(message: Message, app_context: AppContext) -> bool:
@@ -2299,7 +2245,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             project_count=len(projects),
             showing_repo_list=False,
             showing_branch_list=False,
-            whisper_summary=whisper_state.summary if whisper_state.installed else None,
+            whisper_summary=None if whisper_state.installed else whisper_state.summary,
         )
         if flash_message:
             text = f"{text}\n\n<blockquote>{flash_message}</blockquote>"
@@ -2327,7 +2273,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 project_count=len(projects),
                 showing_repo_list=True,
                 showing_branch_list=False,
-                whisper_summary=whisper_state.summary if whisper_state.installed else None,
+                whisper_summary=None if whisper_state.installed else whisper_state.summary,
             ),
             home_keyboard(
                 project_names=project_names,
@@ -2354,7 +2300,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 project_count=len(projects),
                 showing_repo_list=False,
                 showing_branch_list=True,
-                whisper_summary=whisper_state.summary if whisper_state.installed else None,
+                whisper_summary=None if whisper_state.installed else whisper_state.summary,
             ),
             home_keyboard(
                 project_names=project_names,
@@ -2920,8 +2866,11 @@ def _render_streaming_message(
     return html.escape(clipped_body if finished or clipped_body else "Thinking…")
 
 
-def _render_draft_stream_message(body: str) -> str:
-    return _clip_stream_text(body, limit=3800)
+def _render_draft_stream_message(body: str, *, heartbeat_tick: int = 0) -> str:
+    rendered = _clip_stream_text(body, limit=3800)
+    if heartbeat_tick % 2:
+        return f"{rendered}\u2060"
+    return rendered
 
 
 def _render_final_stream_message(*, body: str, failed: bool = False) -> str:

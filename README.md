@@ -2,34 +2,31 @@
 
 # ex-cod-tg
 
-Remote Telegram interface for Codex CLI running on your computer.
+Telegram remote for Codex CLI running locally on your own machine.
 
 Built for a simple workflow:
 
-- run the bot on your machine
+- install once on your machine
 - open Telegram on your phone
 - pick a repo and git branch
-- send a plain message
+- send a normal message
 - Codex works locally and streams the reply back into Telegram
 
-## Features
+## Core features
 
-- convenient auto-updating Telegram menu
-- project switching with `prev / next` and `All repos`
-- git branch switching with `prev / next` and `All branches`
-- model and thinking-level switching for Codex tasks
-- selected-model presets for quick switching
-- plain chat messages sent directly to Codex with streaming output
-- photos and image files passed to Codex with caption-now or text-next UX
-- optional local Whisper transcription for Telegram voice messages
-- in-app bot update button with release notes after restart
-- macOS menu bar helper with bot status, start/stop controls, logs, and launch-at-login toggle
-- built-in commands: `/ask`, `/fix`, `/diff`, `/log`, `/commit`, `/run`
-- Codex CLI auth screen with login, logout, and refresh
-- automatic first-admin bootstrap on the first `/start`
-- admin management directly from Telegram
-- async command queue so sessions do not overlap
-- background service support for macOS and Linux
+- control Codex CLI from Telegram
+- run everything locally on your own machine
+- macOS and Linux support
+- automatic workspace root detection
+- switch repositories and git branches from the main menu
+- switch models and thinking depth in one tap
+- choose your preferred models in Settings
+- easy Codex CLI device login from Telegram
+- optional Whisper voice transcription
+- image input support for screenshots and UI references
+- built-in admin access control
+- self-update flow with GitHub update detection
+- macOS tray helper with service controls and launch at login
 
 ## Quick Start
 
@@ -47,7 +44,7 @@ After that:
 4. Open the bot in Telegram and send `/start`.
 5. The first user who sends `/start` becomes the first admin.
 
-The only thing you need to enter in the terminal is your Telegram bot token.
+The only thing you need to enter in the terminal is your Telegram bot token. Workspaces root detection, active repo selection, model selection, and day-to-day settings happen inside the bot.
 
 On macOS, the install also adds a menu bar helper so you can see bot status, open logs, and start or stop the bot from the system tray.
 
@@ -60,6 +57,35 @@ On macOS, the install also adds a menu bar helper so you can see bot status, ope
 - all Codex, git, and shell commands execute on your machine
 - the bot uses long polling, so no webhook, reverse proxy, or tunnel is required
 
+## Bot Interface
+
+### Main screen
+
+- see the active repo, latest commit, diff summary, and bot update status
+- switch repositories with `prev / next` or jump through `All repos`
+- switch branches with `prev / next` or jump through `All branches`
+- tap `Model` and `Thinking` to cycle the current Codex defaults instantly
+- send a normal chat message at any time to start work in the active repo
+
+When a newer `ex-cod-tg` version is available, the main screen shows an update notice and points you to Settings to install it.
+
+![ex-cod update notice](docs/screenshots/ex-cod-update.webp)
+
+### Settings
+
+- manage admins directly from Telegram
+- log in or out of Codex CLI with device auth
+- choose which models appear in quick model switching
+- install or remove local Whisper transcription
+- update the bot from Telegram when GitHub shows a newer version
+- change the workspaces root without editing config files
+
+### Media input
+
+- send screenshots and other image references with a caption to run immediately
+- send images first and text next if you want to build the prompt in two steps
+- send a voice message, review the Whisper transcription, and approve it before Codex runs
+
 ## Installation Details
 
 `install.sh` is the one-command installer:
@@ -70,18 +96,19 @@ On macOS, the install also adds a menu bar helper so you can see bot status, ope
 - runs `ex-cod-tg service install`
 - on macOS, also installs the menu bar helper so the bot and helper launch together at login
 
-## Telegram Commands
+## Chat and Commands
+
+Plain chat is the default interface.
 
 - `/start` — open the main dashboard
 - `/help` — show help
-- `/ask <text>` — send a prompt to Codex
-- `/fix <task>` — ask Codex to fix something
 - `/run <command>` — run a restricted shell command
 - `/diff` — show git diff
-- `/commit <message>` — run `git add -A` and create a commit
 - `/log` — show recent commits
 
-Plain text messages also work: just send a task in chat and Codex will start.
+Most Codex work does not need a slash command. Just send a normal message in chat.
+
+That includes asking questions, fixing bugs, refactoring, writing code, and even asking Codex to create a commit.
 
 Photos and image files also work:
 
@@ -102,30 +129,18 @@ macOS: ~/Library/Application Support/ex-cod-tg/config.env
 Linux: ~/.config/ex-cod-tg/config.env
 ```
 
-That matters for security:
+The installer and onboarding create this for you. In normal use you only need to paste the Telegram bot token once in the terminal.
 
-- your real Telegram bot token is not stored in this repo by default
-- `.env` is ignored
-- local virtualenvs, logs, caches, and build artifacts are ignored
+After that, the practical settings live in the bot UI:
 
-Example config:
+- active repository and branch
+- selected models
+- current model and thinking depth
+- Codex CLI login
+- Whisper install or removal
+- workspaces root
 
-```env
-TELEGRAM_BOT_TOKEN=1234567890:telegram-token
-ADMIN_IDS=
-WORKSPACES_ROOT=/Users/your-user/Developer
-ACTIVE_PROJECT_PATH=/Users/your-user/Developer/your-project
-CODEX_BIN=codex
-CODEX_MODEL=gpt-5.4
-CODEX_SELECTED_MODELS=gpt-5.4,gpt-5.4-mini
-CODEX_THINKING_LEVEL=high
-COMMAND_TIMEOUT_SECONDS=900
-SHELL_TIMEOUT_SECONDS=120
-GIT_TIMEOUT_SECONDS=120
-MAX_OUTPUT_CHARS=20000
-TELEGRAM_MAX_IMAGES_PER_REQUEST=10
-TELEGRAM_IMAGE_MAX_BYTES=20971520
-```
+Power users can still edit `config.env` manually, but most users never need to touch it.
 
 ## Security Notes
 
@@ -138,22 +153,14 @@ TELEGRAM_IMAGE_MAX_BYTES=20971520
 
 The installer already sets up the background service for you.
 
-Manual service management after installation:
-
 After updating the repo:
 
 ```bash
 ex-cod-tg service restart
 ```
 
-To remove the service:
-
-```bash
-ex-cod-tg service uninstall
-```
-
 ## Notes
 
-- `All repos` shows top-level folders inside `WORKSPACES_ROOT`
+- `All repos` shows top-level folders inside the detected workspaces root
 - `All branches` shows local git branches for the active repo
 - if Codex CLI is missing, the bot still starts, but Codex actions will fail until `codex` is installed
