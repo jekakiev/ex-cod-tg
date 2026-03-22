@@ -39,6 +39,11 @@ def main() -> int:
 
     _configure_logging(paths)
 
+    def make_item(target: object, title: str, action: str):
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+        item.setTarget_(target)
+        return item
+
     class TrayController(NSObject):  # type: ignore[misc]
         def init(self) -> TrayController | None:  # type: ignore[override]
             self = objc.super(TrayController, self).init()
@@ -82,30 +87,25 @@ def main() -> int:
 
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            self.start_menu_item = self._item("Start bot", "startBot:")
-            self.stop_menu_item = self._item("Stop bot", "stopBot:")
-            self.restart_menu_item = self._item("Restart bot", "restartBot:")
+            self.start_menu_item = make_item(self, "Start bot", "startBot:")
+            self.stop_menu_item = make_item(self, "Stop bot", "stopBot:")
+            self.restart_menu_item = make_item(self, "Restart bot", "restartBot:")
             self.menu.addItem_(self.start_menu_item)
             self.menu.addItem_(self.stop_menu_item)
             self.menu.addItem_(self.restart_menu_item)
 
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            self.menu.addItem_(self._item("Open logs", "openLogs:"))
-            self.launch_item = self._item("Launch at login", "toggleLaunchAtLogin:")
+            self.menu.addItem_(make_item(self, "Open logs", "openLogs:"))
+            self.launch_item = make_item(self, "Launch at login", "toggleLaunchAtLogin:")
             self.menu.addItem_(self.launch_item)
 
             self.menu.addItem_(NSMenuItem.separatorItem())
-            self.menu.addItem_(self._item("Quit", "quitApp:"))
+            self.menu.addItem_(make_item(self, "Quit", "quitApp:"))
 
             self.status_item.setMenu_(self.menu)
             self.refreshStatus_(None)
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(3.0, self, "refreshStatus:", None, True)
-
-        def _item(self, title: str, action: str):
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
-            item.setTarget_(self)
-            return item
 
         def refreshStatus_(self, sender) -> None:
             running = is_launch_agent_loaded(self.paths.service_label)

@@ -113,6 +113,39 @@ class CodexStreamResult:
 
 
 @dataclass(slots=True)
+class CodexStreamEvent:
+    kind: str
+    text: str
+    is_delta: bool
+
+
+@dataclass(slots=True)
+class CodexStreamAccumulator:
+    assistant_text: str = ""
+    reasoning_text: str = ""
+
+    def apply_raw_line(self, raw_line: str) -> str | None:
+        event = _parse_codex_stream_event(raw_line)
+        if event is None:
+            return None
+
+        attribute = "reasoning_text" if event.kind == "reasoning" else "assistant_text"
+        current = getattr(self, attribute)
+        updated = _merge_stream_text(current, event.text, is_delta=event.is_delta)
+        if updated != current:
+            setattr(self, attribute, updated)
+
+        return self.preview_text
+
+    @property
+    def preview_text(self) -> str:
+        assistant = self.assistant_text.strip()
+        if assistant:
+            return assistant
+        return self.reasoning_text.strip()
+
+
+@dataclass(slots=True)
 class WhisperState:
     installed: bool
     model_name: str
@@ -823,8 +856,9 @@ class CodexRunner:
             return CodexStreamResult(result=result, final_text="")
 
         stderr_lines: list[str] = []
-        stream_fragments: list[str] = []
-        raw_stdout_lines: list[str] = []
+        stream_state = CodexStreamAccumulator()
+        raw_stdout_parts: list[str] = []
+        stdout_buffer = ""
         last_emit_at = 0.0
 
         async def emit(force: bool = False) -> None:
@@ -834,7 +868,7 @@ class CodexRunner:
             now = time.monotonic()
             if not force and now - last_emit_at < 0.8:
                 return
-            payload = "".join(stream_fragments).strip()
+            payload = stream_state.preview_text
             await on_update(payload)
             last_emit_at = now
 
@@ -853,18 +887,33 @@ class CodexRunner:
         try:
             if process.stdout is not None:
                 while True:
-                    line = await asyncio.wait_for(
-                        process.stdout.readline(),
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(4096),
                         timeout=self.config.command_timeout_seconds,
                     )
-                    if not line:
+                    if not chunk:
                         break
-                    decoded = line.decode("utf-8", errors="replace")
-                    raw_stdout_lines.append(decoded)
-                    fragment = _extract_codex_stream_fragment(decoded)
-                    if fragment:
-                        stream_fragments.append(fragment)
-                        await emit()
+                    decoded_chunk = chunk.decode("utf-8", errors="replace")
+                    raw_stdout_parts.append(decoded_chunk)
+                    stdout_buffer += decoded_chunk
+
+                    lines = stdout_buffer.splitlines()
+                    if stdout_buffer.endswith(("\n", "\r")):
+                        complete_lines = lines
+                        stdout_buffer = ""
+                    else:
+                        complete_lines = lines[:-1]
+                        stdout_buffer = lines[-1] if lines else stdout_buffer
+
+                    for raw_line in complete_lines:
+                        preview = stream_state.apply_raw_line(raw_line)
+                        if preview:
+                            await emit()
+
+                if stdout_buffer:
+                    preview = stream_state.apply_raw_line(stdout_buffer)
+                    if preview:
+                        await emit(force=True)
             await asyncio.wait_for(process.wait(), timeout=self.config.command_timeout_seconds)
         except asyncio.TimeoutError:
             timed_out = True
@@ -877,7 +926,7 @@ class CodexRunner:
 
         duration_seconds = time.perf_counter() - started_at
         exit_code = process.returncode if not timed_out else -1
-        stdout = "".join(raw_stdout_lines)
+        stdout = "".join(raw_stdout_parts)
         stderr = "".join(stderr_lines)
 
         final_text = ""
@@ -888,7 +937,7 @@ class CodexRunner:
                 output_file.unlink()
 
         if not final_text:
-            final_text = "".join(stream_fragments).strip()
+            final_text = stream_state.assistant_text.strip() or stream_state.preview_text
 
         if timed_out:
             stderr = (
@@ -1228,7 +1277,7 @@ class CodexRunner:
         return "Not logged in"
 
 
-def _extract_codex_stream_fragment(raw_line: str) -> str | None:
+def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
     line = raw_line.strip()
     if not line.startswith("{"):
         return None
@@ -1239,6 +1288,7 @@ def _extract_codex_stream_fragment(raw_line: str) -> str | None:
         return None
 
     event_type = str(payload.get("type", "")).lower()
+    normalized_event_type = event_type.replace(".", "_")
     candidate_values: list[Any] = []
 
     if "delta" in payload:
@@ -1253,22 +1303,52 @@ def _extract_codex_stream_fragment(raw_line: str) -> str | None:
         candidate_values.append(payload["data"])
     if "text" in payload:
         candidate_values.append(payload["text"])
+    if "part" in payload:
+        candidate_values.append(payload["part"])
+    if "summary" in payload:
+        candidate_values.append(payload["summary"])
+    if "reasoning" in payload:
+        candidate_values.append(payload["reasoning"])
+    if "response" in payload:
+        candidate_values.append(payload["response"])
+    if "output" in payload:
+        candidate_values.append(payload["output"])
 
-    if "delta" not in event_type and "message" not in event_type and "response" not in event_type:
+    if not any(
+        marker in normalized_event_type
+        for marker in (
+            "delta",
+            "message",
+            "response",
+            "output_text",
+            "output_item",
+            "reasoning",
+            "summary",
+            "thinking",
+        )
+    ):
         return None
 
     fragments: list[str] = []
     for value in candidate_values:
         _collect_text_fragments(value, fragments)
 
-    joined = "".join(fragments).strip()
-    return joined or None
+    joined = "".join(fragments)
+    if _is_low_value_stream_text(joined):
+        return None
+
+    kind = "reasoning" if any(marker in normalized_event_type for marker in ("reasoning", "summary", "thinking")) else "assistant"
+    return CodexStreamEvent(
+        kind=kind,
+        text=joined,
+        is_delta="delta" in normalized_event_type,
+    )
 
 
 def _collect_text_fragments(value: Any, fragments: list[str]) -> None:
     if isinstance(value, str):
-        cleaned = value.strip("\n")
-        if cleaned:
+        cleaned = value.replace("\x00", "")
+        if cleaned.strip():
             fragments.append(cleaned)
         return
 
@@ -1281,13 +1361,49 @@ def _collect_text_fragments(value: Any, fragments: list[str]) -> None:
         return
 
     for key, item in value.items():
-        if key in {"id", "index", "type", "role", "status", "name", "model", "usage"}:
+        normalized_key = str(key).lower()
+        if normalized_key in {"id", "index", "type", "role", "status", "name", "model", "usage"}:
             continue
-        if key in {"text", "delta", "content", "message", "output_text"}:
+        if normalized_key in {"text", "delta", "content", "message", "output_text", "summary", "reasoning"}:
             _collect_text_fragments(item, fragments)
             continue
-        if key in {"data", "item", "content_part", "part"}:
+        if normalized_key in {"data", "item", "content_part", "part", "response", "output"}:
+            _collect_text_fragments(item, fragments)
+            continue
+        if any(marker in normalized_key for marker in ("text", "delta", "content", "message", "summary", "reasoning")):
             _collect_text_fragments(item, fragments)
             continue
         if isinstance(item, (dict, list)):
             _collect_text_fragments(item, fragments)
+
+
+def _merge_stream_text(current: str, incoming: str, *, is_delta: bool) -> str:
+    if not incoming.strip():
+        return current
+    if not current:
+        return incoming
+    if is_delta:
+        return f"{current}{incoming}"
+    if incoming == current:
+        return current
+    if incoming.startswith(current):
+        return incoming
+    if current.endswith(incoming):
+        return current
+    if len(incoming) > len(current):
+        return incoming
+    return current
+
+
+def _is_low_value_stream_text(value: str) -> bool:
+    normalized = value.replace("\x00", "").strip()
+    if not normalized:
+        return True
+    return normalized.lower() in {
+        "thinking",
+        "thinking…",
+        "thinking...",
+        "working",
+        "working…",
+        "working...",
+    }

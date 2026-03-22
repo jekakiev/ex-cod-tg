@@ -2,6 +2,7 @@
 
 ## 0.1.4
 
+- Telegram replies now stream live preview text while Codex is thinking, instead of staying on a static `Thinking…` placeholder until the end.
 - Bot update flow now asks for confirmation, shows progress in Settings, and reinstalls the service instead of only restarting it.
 - Settings and navigation callbacks acknowledge taps faster and avoid expensive repo and branch scans on unrelated pages.
 - Update notices are now more reliable after background service restarts.
@@ -10,6 +11,7 @@
 - Quick model and thinking taps now keep the full dashboard menu intact instead of replacing it with a tiny controls row.
 - Added a macOS menu bar helper with bot status, start/stop controls, log access, and a launch-at-login toggle.
 - In-bot updates on macOS now hand off the final service reinstall to a separate launchd updater job so new helpers also appear after update.
+- Fixed the macOS tray helper startup crash and switched Codex streaming to chunk-based parsing so long JSON events do not break live replies.
 
 ## 0.1.3
 
