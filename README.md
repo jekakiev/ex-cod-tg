@@ -46,9 +46,11 @@ After that:
 
 The only thing you need to enter in the terminal is your Telegram bot token. Workspaces root detection, active repo selection, model selection, and day-to-day settings happen inside the bot.
 
+![ex-cod onboarding](docs/screenshots/ex-cod_onboarding.webp)
+
 On macOS, the install also adds a menu bar helper so you can see bot status, open logs, and start or stop the bot from the system tray.
 
-![ex-cod onboarding](docs/screenshots/ex-cod_onboarding.webp)
+![ex-cod tray helper](docs/screenshots/ex-cod-tray.webp)
 
 ## How It Works
 
@@ -78,7 +80,11 @@ When a newer `ex-cod-tg` version is available, the main screen shows an update n
 - choose which models appear in quick model switching
 - install or remove local Whisper transcription
 - update the bot from Telegram when GitHub shows a newer version
-- change the workspaces root without editing config files
+- change the workspaces root without editing config files, with manual path entry in chat for now
+
+![ex-cod codex auth](docs/screenshots/ex-cod-codex-auth.webp)
+
+![ex-cod settings](docs/screenshots/ex-cod-settings-codex-models.webp)
 
 ### Media input
 
@@ -92,6 +98,7 @@ When a newer `ex-cod-tg` version is available, the main screen shows an update n
 
 - creates an isolated virtual environment for `ex-cod-tg`
 - installs `ex-cod-tg` from GitHub into that environment
+- installs Codex CLI automatically via npm when `codex` is missing
 - creates a local `ex-cod-tg` CLI shim in `~/.local/bin`
 - runs `ex-cod-tg service install`
 - on macOS, also installs the menu bar helper so the bot and helper launch together at login
@@ -118,7 +125,11 @@ Photos and image files also work:
 
 Model and thinking level are switched directly from the Telegram buttons on the dashboard and under each Codex reply.
 
-Voice messages also work when Whisper is installed: the bot transcribes them locally, shows the text for confirmation, and only runs Codex after approval.
+![ex-cod quick controls](docs/screenshots/ex-cod-quick-controls.webp)
+
+Voice messages also work when Whisper is installed: the bot transcribes them locally, shows the text for confirmation, and only runs Codex after approval. Processing speed depends on your machine, and in my testing English works best so far. The preview message is easy to edit: tap it to copy the text, paste it into the input field, fix any mistakes, and send it back as a normal message.
+
+![ex-cod voice](docs/screenshots/ex-cod-voice.webp)
 
 ## Configuration
 
@@ -163,4 +174,3 @@ ex-cod-tg service restart
 
 - `All repos` shows top-level folders inside the detected workspaces root
 - `All branches` shows local git branches for the active repo
-- if Codex CLI is missing, the bot still starts, but Codex actions will fail until `codex` is installed

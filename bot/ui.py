@@ -63,6 +63,7 @@ def build_home_text(
     showing_repo_list: bool,
     showing_branch_list: bool,
     whisper_summary: str | None,
+    codex_notice: str | None,
 ) -> str:
     latest_commit_line = environment.latest_commit_summary or ("not a git repo" if environment.git_repo is False else "unavailable")
     if environment.changed_files_count is None:
@@ -71,15 +72,17 @@ def build_home_text(
         diff_line = f"{environment.changed_files_count} file(s)"
     lines = [
         f"<b>ex-cod {APP_VERSION}</b>\n\n"
+        f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>\n\n"
         f"Project: <code>{html.escape(active_project_name)}</code>\n"
         f"Latest commit: <code>{html.escape(latest_commit_line)}</code>\n"
-        f"Diff: <code>{html.escape(diff_line)}</code>\n\n"
-        f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>"
+        f"Diff: <code>{html.escape(diff_line)}</code>"
     ]
     if whisper_summary:
         lines.insert(-1, f"Whisper: <code>{html.escape(whisper_summary)}</code>\n")
     if update_state.update_available:
-        lines.append('\n\n<blockquote>Update available. Open Settings to update the bot.</blockquote>')
+        lines.insert(1, '<blockquote>Update available. Open Settings to update the bot.</blockquote>\n\n')
+    if codex_notice:
+        lines.append(f"\n\n<blockquote>{html.escape(codex_notice)}</blockquote>")
     if showing_repo_list:
         lines.append("\nSelect the repository to use below.")
     elif showing_branch_list:

@@ -1195,6 +1195,14 @@ async def _get_auth_state(app_context: AppContext, *, force: bool = False) -> Co
     return auth_state
 
 
+def _home_codex_notice(auth_state: CodexAuthState) -> str | None:
+    if auth_state.cli_path is None:
+        return "Codex CLI is not installed. Re-run the installer to install it automatically."
+    if auth_state.logged_in:
+        return None
+    return "Codex CLI is not authorized yet. Open Settings -> Codex CLI to log in."
+
+
 async def _get_whisper_state(app_context: AppContext, *, force: bool = False) -> WhisperState:
     now = time.monotonic()
     if (
@@ -2233,6 +2241,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
 
     if page == "home":
         environment = await _get_environment_status(app_context)
+        auth_state = await _get_auth_state(app_context)
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         flash_message = app_context.flash_message
@@ -2246,6 +2255,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             showing_repo_list=False,
             showing_branch_list=False,
             whisper_summary=None if whisper_state.installed else whisper_state.summary,
+            codex_notice=_home_codex_notice(auth_state),
         )
         if flash_message:
             text = f"{text}\n\n<blockquote>{flash_message}</blockquote>"
@@ -2262,6 +2272,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
 
     if page == "repos":
         environment = await _get_environment_status(app_context)
+        auth_state = await _get_auth_state(app_context)
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         return (
@@ -2274,6 +2285,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 showing_repo_list=True,
                 showing_branch_list=False,
                 whisper_summary=None if whisper_state.installed else whisper_state.summary,
+                codex_notice=_home_codex_notice(auth_state),
             ),
             home_keyboard(
                 project_names=project_names,
@@ -2289,6 +2301,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
 
     if page == "branches":
         environment = await _get_environment_status(app_context)
+        auth_state = await _get_auth_state(app_context)
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         return (
@@ -2301,6 +2314,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 showing_repo_list=False,
                 showing_branch_list=True,
                 whisper_summary=None if whisper_state.installed else whisper_state.summary,
+                codex_notice=_home_codex_notice(auth_state),
             ),
             home_keyboard(
                 project_names=project_names,
@@ -2876,8 +2890,8 @@ def _render_draft_stream_message(body: str, *, heartbeat_tick: int = 0) -> str:
 def _render_final_stream_message(*, body: str, failed: bool = False) -> str:
     clipped_body = _clip_stream_text(body)
     if failed:
-        return f"Failed to run Codex.\n\n{clipped_body}"
-    return clipped_body
+        return f"Failed to run Codex.\n\n{html.escape(clipped_body)}"
+    return html.escape(clipped_body)
 
 
 def _supports_native_streaming_drafts(message: Message) -> bool:
