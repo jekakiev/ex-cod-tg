@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${EX_COD_TG_REPO_URL:-git+https://github.com/jekakiev/ex-cod-tg.git}"
+REPO_URL="${EX_COD_TG_REPO_URL:-git+https://github.com/jekakiev/ex-cod-tg.git@main}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 BIN_DIR="${EX_COD_TG_BIN_DIR:-$HOME/.local/bin}"
 
@@ -54,7 +54,7 @@ echo "Creating virtual environment..."
 
 echo "Installing ex-cod-tg..."
 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
-"$VENV_DIR/bin/python" -m pip install --upgrade "$REPO_URL"
+"$VENV_DIR/bin/python" -m pip install --upgrade --force-reinstall --no-cache-dir "$REPO_URL"
 
 ln -sf "$EX_COD_BIN" "$SHIM_PATH"
 

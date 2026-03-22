@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 WHISPER_MODEL_NAME = "tiny"
 WHISPER_PIP_PACKAGE = "faster-whisper"
-SELF_REPO_URL = "git+https://github.com/jekakiev/ex-cod-tg.git"
+SELF_REPO_URL = "git+https://github.com/jekakiev/ex-cod-tg.git@main"
 GITHUB_COMMITS_API = "https://api.github.com/repos/jekakiev/ex-cod-tg/commits/"
 RAW_GITHUB_BASE = "https://raw.githubusercontent.com/jekakiev/ex-cod-tg"
 
@@ -447,7 +447,7 @@ class CodexRunner:
 
     async def install_self_update(self) -> list[tuple[str, CommandResult]]:
         pip_result = await self._run_process(
-            [sys.executable, "-m", "pip", "install", "--upgrade", SELF_REPO_URL],
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-cache-dir", SELF_REPO_URL],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
