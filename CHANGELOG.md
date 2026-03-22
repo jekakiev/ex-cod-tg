@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8
+
+- Private Telegram chats now use native `sendMessageDraft` streaming instead of repeated message edits, which makes long Codex replies look much closer to real live typing.
+- Final Codex replies are sent as normal Telegram replies with controls after draft streaming finishes, while non-private chats still fall back to the older edit-based flow.
+
 ## 0.1.7
 
 - Partial Telegram reply streaming now trims unstable trailing fragments, so visible text no longer breaks off mid-word before the next update lands.

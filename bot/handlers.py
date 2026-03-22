@@ -1625,6 +1625,16 @@ async def _run_codex_chat_request(
             "This bot runs Codex requests one by one."
         )
 
+    if _supports_native_streaming_drafts(message):
+        await _run_codex_chat_request_native(
+            message,
+            app_context,
+            prompt,
+            user_id=user_id,
+            image_paths=image_paths or [],
+        )
+        return
+
     reply = await message.reply(
         _render_streaming_message(
             body="Thinking…",
@@ -1685,6 +1695,47 @@ async def _run_codex_chat_request(
                 current_model=app_context.config.codex_model,
                 current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
             ),
+        )
+
+
+async def _run_codex_chat_request_native(
+    message: Message,
+    app_context: AppContext,
+    prompt: str,
+    *,
+    user_id: int | None,
+    image_paths: list[Path],
+) -> None:
+    draft_id = _build_stream_draft_id(message)
+
+    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+        result = await app_context.queue.submit(
+            f"chat by {user_id}",
+            lambda: _execute_codex_chat_stream_native(
+                message=message,
+                draft_id=draft_id,
+                prompt=prompt,
+                app_context=app_context,
+                image_paths=image_paths,
+            ),
+        )
+
+    current_thinking_level = _effective_thinking_level(app_context, app_context.config.codex_model)
+    markup = response_controls_keyboard(
+        current_model=app_context.config.codex_model,
+        current_thinking_level=current_thinking_level,
+    )
+    if result.result.ok:
+        final_body = result.final_text.strip() or "Completed with no assistant text."
+        await message.reply(
+            _render_final_stream_message(body=final_body),
+            reply_markup=markup,
+        )
+    else:
+        error_text = result.result.stderr or result.result.stdout or "Codex failed."
+        await message.reply(
+            _render_final_stream_message(body=error_text, failed=True),
+            reply_markup=markup,
         )
 
 
@@ -1825,6 +1876,80 @@ async def _execute_codex_chat_stream(
                 current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
             ),
         )
+        last_edit_at = now
+        last_rendered_text = text
+
+    spinner_task = asyncio.create_task(spinner())
+    try:
+        return await app_context.runner.run_codex_streaming_prompt(
+            prompt,
+            image_paths=image_paths,
+            on_update=on_update,
+        )
+    finally:
+        spinner_stop.set()
+        spinner_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await spinner_task
+
+
+async def _execute_codex_chat_stream_native(
+    *,
+    message: Message,
+    draft_id: int,
+    prompt: str,
+    app_context: AppContext,
+    image_paths: list[Path],
+) -> Any:
+    last_edit_at = 0.0
+    last_rendered_text = ""
+    preview_seen = False
+    spinner_stop = asyncio.Event()
+
+    async def update_draft(text: str) -> None:
+        try:
+            await message.bot.send_message_draft(
+                chat_id=message.chat.id,
+                draft_id=draft_id,
+                text=_render_draft_stream_message(text),
+            )
+        except Exception:
+            logger.exception("Failed to send Telegram draft update")
+
+    async def spinner() -> None:
+        started_at = time.monotonic()
+        frame_index = 0
+        frames = (
+            "Thinking",
+            "Thinking.",
+            "Thinking..",
+            "Thinking...",
+            "Generating reply",
+            "Preparing reply",
+        )
+        while not spinner_stop.is_set():
+            await asyncio.sleep(1.2)
+            if spinner_stop.is_set() or preview_seen:
+                continue
+            elapsed = int(time.monotonic() - started_at)
+            frame = frames[frame_index % len(frames)]
+            frame_index += 1
+            await update_draft(f"{frame} {elapsed}s")
+
+    async def on_update(text: str) -> None:
+        nonlocal last_edit_at
+        nonlocal last_rendered_text
+        nonlocal preview_seen
+        now = time.monotonic()
+        text = text.strip()
+        if not text:
+            return
+        preview_seen = True
+        if text == last_rendered_text:
+            return
+        if now - last_edit_at < 0.03:
+            return
+        await update_draft(text)
         last_edit_at = now
         last_rendered_text = text
 
@@ -2793,6 +2918,29 @@ def _render_streaming_message(
     if failed:
         return f"Failed to run Codex.\n\n{html.escape(clipped_body)}"
     return html.escape(clipped_body if finished or clipped_body else "Thinking…")
+
+
+def _render_draft_stream_message(body: str) -> str:
+    return _clip_stream_text(body, limit=3800)
+
+
+def _render_final_stream_message(*, body: str, failed: bool = False) -> str:
+    clipped_body = _clip_stream_text(body)
+    if failed:
+        return f"Failed to run Codex.\n\n{clipped_body}"
+    return clipped_body
+
+
+def _supports_native_streaming_drafts(message: Message) -> bool:
+    chat = getattr(message, "chat", None)
+    bot = getattr(message, "bot", None)
+    return bool(chat and chat.type == "private" and bot and hasattr(bot, "send_message_draft"))
+
+
+def _build_stream_draft_id(message: Message) -> int:
+    base = int(time.time_ns() & 0x7FFFFFFF)
+    fallback = message.message_id if message.message_id > 0 else 1
+    return base or fallback
 
 
 async def _edit_streaming_message(message: Message, text: str, reply_markup: Any | None = None) -> None:
