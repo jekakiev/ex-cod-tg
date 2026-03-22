@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Live Codex streaming now ignores internal reasoning text in Telegram and starts showing only user-facing reply content as soon as partial assistant text appears.
+- Streaming updates arrive earlier from partial JSON chunks, with a lighter waiting spinner while the first visible reply text is still being generated.
+- Bot update progress no longer reaches 100% before the restarted bot is actually back online.
+
 ## 0.1.4
 
 - Telegram replies now stream live preview text while Codex is thinking, instead of staying on a static `Thinking…` placeholder until the end.

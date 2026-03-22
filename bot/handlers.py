@@ -1723,7 +1723,14 @@ async def _execute_codex_chat_stream(
     async def spinner() -> None:
         started_at = time.monotonic()
         frame_index = 0
-        frames = ("Thinking", "Thinking.", "Thinking..", "Thinking...")
+        frames = (
+            "Thinking",
+            "Thinking.",
+            "Thinking..",
+            "Thinking...",
+            "Generating reply",
+            "Preparing reply",
+        )
         while not spinner_stop.is_set():
             await asyncio.sleep(1.2)
             if spinner_stop.is_set() or preview_seen:

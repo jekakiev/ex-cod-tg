@@ -144,16 +144,11 @@ class CodexStreamAccumulator:
 
     def preview_text_with_partial(self, raw_buffer: str) -> str:
         assistant = self.assistant_text.strip()
-        reasoning = self.reasoning_text.strip()
         partial_event = _parse_partial_codex_stream_event(raw_buffer)
         if partial_event is not None:
-            if partial_event.kind == "reasoning":
-                reasoning = _merge_stream_text(reasoning, partial_event.text, is_delta=False).strip()
-            else:
+            if partial_event.kind != "reasoning":
                 assistant = _merge_stream_text(assistant, partial_event.text, is_delta=False).strip()
-        if assistant:
-            return assistant
-        return reasoning
+        return assistant
 
 
 @dataclass(slots=True)
