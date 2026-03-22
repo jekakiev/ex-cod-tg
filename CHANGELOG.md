@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7
+
+- Partial Telegram reply streaming now trims unstable trailing fragments, so visible text no longer breaks off mid-word before the next update lands.
+- Streaming edits are sent more frequently, which makes long Codex replies feel less like a full redraw and more like steady live writing.
+
 ## 0.1.6
 
 - Telegram image input is now supported: send a captioned photo to run Codex immediately, or send images first and text next to use them in one request.

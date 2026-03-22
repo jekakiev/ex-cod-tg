@@ -149,6 +149,7 @@ class CodexStreamAccumulator:
         if partial_event is not None:
             if partial_event.kind != "reasoning":
                 assistant = _merge_stream_text(assistant, partial_event.text, is_delta=False).strip()
+                assistant = _stabilize_partial_stream_text(assistant)
         return assistant
 
 
@@ -893,7 +894,7 @@ class CodexRunner:
             if payload == last_payload:
                 return
             now = time.monotonic()
-            if not force and now - last_emit_at < 0.08:
+            if not force and now - last_emit_at < 0.03:
                 return
             await on_update(payload)
             last_emit_at = now
@@ -1452,6 +1453,18 @@ def _trim_incomplete_json_escape(value: str) -> str:
     if unicode_match:
         return value[: unicode_match.start()]
     return value
+
+
+def _stabilize_partial_stream_text(value: str) -> str:
+    normalized = value.replace("\x00", "").strip()
+    if not normalized:
+        return ""
+    if normalized[-1].isspace() or normalized[-1] in ".!,?:;)]}\"'":
+        return normalized
+    cutoff = max(normalized.rfind(" "), normalized.rfind("\n"), normalized.rfind("\t"))
+    if cutoff >= 24:
+        return normalized[:cutoff].rstrip()
+    return normalized
 
 
 def _collect_text_fragments(value: Any, fragments: list[str]) -> None:

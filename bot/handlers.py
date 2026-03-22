@@ -1812,7 +1812,7 @@ async def _execute_codex_chat_stream(
         preview_seen = True
         if text == last_rendered_text:
             return
-        if now - last_edit_at < 0.08:
+        if now - last_edit_at < 0.03:
             return
         await _edit_streaming_message(
             reply,
