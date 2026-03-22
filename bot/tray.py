@@ -53,8 +53,7 @@ def main() -> int:
             self.status_item = None
             self.menu = None
             self.status_menu_item = None
-            self.start_menu_item = None
-            self.stop_menu_item = None
+            self.toggle_bot_menu_item = None
             self.restart_menu_item = None
             self.launch_item = None
             self.icon_path = Path(__file__).resolve().parent / "assets" / "tray_icon.png"
@@ -88,11 +87,9 @@ def main() -> int:
 
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            self.start_menu_item = make_item(self, "Start bot", "startBot:")
-            self.stop_menu_item = make_item(self, "Stop bot", "stopBot:")
+            self.toggle_bot_menu_item = make_item(self, "Start bot", "toggleBot:")
             self.restart_menu_item = make_item(self, "Restart bot", "restartBot:")
-            self.menu.addItem_(self.start_menu_item)
-            self.menu.addItem_(self.stop_menu_item)
+            self.menu.addItem_(self.toggle_bot_menu_item)
             self.menu.addItem_(self.restart_menu_item)
 
             self.menu.addItem_(NSMenuItem.separatorItem())
@@ -111,8 +108,8 @@ def main() -> int:
         def refreshStatus_(self, sender) -> None:
             running = is_launch_agent_loaded(self.paths.service_label)
             self.status_menu_item.setTitle_(f"Status: {'Running' if running else 'Stopped'}")
-            self.start_menu_item.setEnabled_(not running)
-            self.stop_menu_item.setEnabled_(running)
+            if self.toggle_bot_menu_item is not None:
+                self.toggle_bot_menu_item.setTitle_("Stop bot" if running else "Start bot")
             self.restart_menu_item.setEnabled_(running)
             if self.launch_item is not None:
                 enabled = is_launch_agent_enabled(self.paths.service_label)
@@ -120,13 +117,12 @@ def main() -> int:
                     enabled = enabled and is_launch_agent_enabled(self.paths.helper_service_label)
                 self.launch_item.setState_(1 if enabled else 0)
 
-        def startBot_(self, sender) -> None:
-            bootstrap_launch_agent(self.paths.service_file)
-            kickstart_launch_agent(self.paths.service_label, check=False)
-            self.refreshStatus_(None)
-
-        def stopBot_(self, sender) -> None:
-            bootout_launch_agent(self.paths.service_file)
+        def toggleBot_(self, sender) -> None:
+            if is_launch_agent_loaded(self.paths.service_label):
+                bootout_launch_agent(self.paths.service_file)
+            else:
+                bootstrap_launch_agent(self.paths.service_file)
+                kickstart_launch_agent(self.paths.service_label, check=False)
             self.refreshStatus_(None)
 
         def restartBot_(self, sender) -> None:
