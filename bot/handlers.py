@@ -55,7 +55,6 @@ from bot.ui import (
     build_selected_models_text,
     build_settings_text,
     build_voice_preview_text,
-    build_whisper_text,
     build_workspaces_root_text,
     codex_keyboard,
     home_keyboard,
@@ -65,7 +64,6 @@ from bot.ui import (
     settings_keyboard,
     thinking_label,
     voice_preview_keyboard,
-    whisper_keyboard,
     workspaces_root_keyboard,
 )
 from bot.workspaces import WorkspaceProject, choose_active_project, project_name, scan_workspace_projects
@@ -425,6 +423,8 @@ async def navigation_callback(query: CallbackQuery, app_context: AppContext) -> 
     page = query.data.split(":", 1)[1]
     if page in {"model", "models", "thinking"}:
         page = "home"
+    elif page == "whisper":
+        page = "settings"
     await query.answer()
     await _show_dashboard_from_callback(query, app_context, page=page)
 
@@ -912,7 +912,7 @@ async def whisper_install_callback(query: CallbackQuery, app_context: AppContext
         if install_ok
         else "❌ Whisper installation failed"
     )
-    await _show_dashboard_from_callback(query, app_context, page="whisper")
+    await _show_dashboard_from_callback(query, app_context, page="settings")
 
 
 @router.callback_query(F.data == "whisper:delete")
@@ -938,7 +938,7 @@ async def whisper_delete_callback(query: CallbackQuery, app_context: AppContext)
     app_context.flash_message = (
         "✅ Whisper removed" if uninstall_ok else "❌ Whisper removal failed"
     )
-    await _show_dashboard_from_callback(query, app_context, page="whisper")
+    await _show_dashboard_from_callback(query, app_context, page="settings")
 
 
 @router.callback_query(F.data == "update:noop")
@@ -1603,7 +1603,7 @@ async def _handle_voice_message(message: Message, app_context: AppContext) -> No
 
     whisper_state = await _get_whisper_state(app_context)
     if not whisper_state.installed:
-        await message.reply("Whisper is not installed yet. Open Settings → Whisper and install it first.")
+        await message.reply("Whisper is not installed yet. Open Settings and install it first.")
         return
 
     jobs_ahead = app_context.queue.jobs_ahead()
@@ -1786,6 +1786,18 @@ async def _refresh_quick_controls_target(query: CallbackQuery, app_context: AppC
     if query.message is None:
         return
 
+    chat_id = query.message.chat.id
+    dashboard = app_context.dashboards.get(chat_id)
+    if dashboard and dashboard.message_id == query.message.message_id:
+        await _refresh_dashboard_for_chat(
+            bot=query.bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=query.from_user.id if query.from_user else dashboard.user_id,
+            page=dashboard.page,
+        )
+        return
+
     try:
         await query.message.edit_reply_markup(
             reply_markup=response_controls_keyboard(
@@ -1914,6 +1926,9 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         update_progress = app_context.update_progress
+        flash_message = app_context.flash_message
+        app_context.flash_message = None
+        whisper_busy = bool(app_context.queue.active_label and app_context.queue.active_label.startswith("whisper "))
         return (
             build_settings_text(
                 auth_state=auth_state,
@@ -1921,8 +1936,11 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 update_state=update_state,
                 workspaces_root=app_context.config.workspaces_root,
                 update_progress_block=_render_update_progress_block(update_progress),
+                flash_message=flash_message,
             ),
             settings_keyboard(
+                whisper_state=whisper_state,
+                whisper_busy=whisper_busy,
                 update_busy=bool(update_progress and update_progress.in_progress),
                 update_confirm_pending=bool(update_progress and update_progress.awaiting_confirmation),
             ),
@@ -1959,16 +1977,19 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             )
         waiting_for_candidate = pending is not None and pending.candidate_id is None
         admin_items = _sorted_admin_items(app_context)
+        can_remove_admins = len(admin_items) > 1
         return (
             build_admins_text(
                 admin_items=admin_items,
                 candidate=candidate,
                 waiting_for_candidate=waiting_for_candidate,
+                can_remove_admins=can_remove_admins,
             ),
             admins_keyboard(
                 admin_items=admin_items,
                 candidate=candidate,
                 waiting_for_candidate=waiting_for_candidate,
+                can_remove_admins=can_remove_admins,
             ),
         )
 
@@ -1985,16 +2006,6 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             ),
             codex_keyboard(auth_state=auth_state, login_active=login_active),
         )
-
-    if page == "whisper":
-        whisper_state = await _get_whisper_state(app_context, force=True)
-        busy = bool(app_context.queue.active_label and app_context.queue.active_label.startswith("whisper "))
-        text = build_whisper_text(whisper_state=whisper_state)
-        flash_message = app_context.flash_message
-        app_context.flash_message = None
-        if flash_message:
-            text = f"{text}\n\n<blockquote>{flash_message}</blockquote>"
-        return text, whisper_keyboard(whisper_state=whisper_state, busy=busy)
 
     return "Unknown page", home_keyboard(
         project_names=[],

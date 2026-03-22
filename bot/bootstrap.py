@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Callable
 
@@ -94,7 +97,7 @@ def prompt_for_config(existing: dict[str, str], *, default_working_dir: Path) ->
         "Telegram bot token from BotFather",
         default=values["TELEGRAM_BOT_TOKEN"],
         required=True,
-        validator=validate_bot_token,
+        validator=validate_and_describe_bot_token,
     )
 
     return {
@@ -136,5 +139,52 @@ def validate_bot_token(value: str) -> str | None:
     if ":" not in value:
         return "Bot token should look like 123456789:ABCDEF..."
     return None
+
+
+def validate_and_describe_bot_token(value: str) -> str | None:
+    format_error = validate_bot_token(value)
+    if format_error:
+        return format_error
+
+    try:
+        profile = fetch_bot_profile(value)
+    except RuntimeError as exc:
+        return str(exc)
+
+    title = profile.get("first_name") or "Unknown bot"
+    username = profile.get("username")
+    print(f"Bot detected: {title}")
+    if username:
+        url = f"https://t.me/{username}"
+        print(f"Bot link: {url}")
+    else:
+        print("Bot link unavailable: this bot has no public username yet.")
+    return None
+
+
+def fetch_bot_profile(token: str) -> dict[str, str]:
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise RuntimeError("Telegram rejected this bot token.")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Unable to reach Telegram right now: {exc.reason}")
+    except json.JSONDecodeError:
+        raise RuntimeError("Telegram returned an invalid response.")
+
+    if not payload.get("ok"):
+        description = payload.get("description") or "Telegram rejected this bot token."
+        raise RuntimeError(str(description))
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Telegram returned an unexpected bot profile.")
+
+    return {
+        "first_name": str(result.get("first_name") or "").strip(),
+        "username": str(result.get("username") or "").strip(),
+    }
 if __name__ == "__main__":
     sys.exit(main())

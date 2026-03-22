@@ -202,6 +202,7 @@ def build_settings_text(
     update_state: BotUpdateState,
     workspaces_root: Path,
     update_progress_block: str | None,
+    flash_message: str | None = None,
 ) -> str:
     text = (
         "<b>Settings</b>\n\n"
@@ -213,10 +214,18 @@ def build_settings_text(
     )
     if update_progress_block:
         text = f"{text}\n\n{update_progress_block}"
+    if flash_message:
+        text = f"{text}\n\n<blockquote>{html.escape(flash_message)}</blockquote>"
     return text
 
 
-def settings_keyboard(*, update_busy: bool, update_confirm_pending: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(
+    *,
+    whisper_state: WhisperState,
+    whisper_busy: bool,
+    update_busy: bool,
+    update_confirm_pending: bool,
+) -> InlineKeyboardMarkup:
     if update_confirm_pending:
         return _keyboard(
             [
@@ -235,7 +244,22 @@ def settings_keyboard(*, update_busy: bool, update_confirm_pending: bool) -> Inl
         ],
         [
             InlineKeyboardButton(text="Selected models", callback_data="nav:selected_models"),
-            InlineKeyboardButton(text="Whisper", callback_data="nav:whisper"),
+            InlineKeyboardButton(
+                text=(
+                    "⏳ Whisper…"
+                    if whisper_busy
+                    else "🗑 Delete Whisper"
+                    if whisper_state.installed
+                    else "⬇️ Install Whisper"
+                ),
+                callback_data=(
+                    "whisper:noop"
+                    if whisper_busy
+                    else "whisper:delete"
+                    if whisper_state.installed
+                    else "whisper:install"
+                ),
+            ),
         ],
     ]
     if update_busy:
@@ -335,6 +359,7 @@ def build_admins_text(
     admin_items: list[tuple[int, str]],
     candidate: PendingAdminCandidate | None,
     waiting_for_candidate: bool,
+    can_remove_admins: bool,
 ) -> str:
     lines = ["<b>Admins</b>", ""]
     if admin_items:
@@ -355,6 +380,8 @@ def build_admins_text(
         lines.append("After that, confirm their access here.")
     else:
         lines.append("Press Add to start waiting for a new admin.")
+        if not can_remove_admins:
+            lines.append("At least one admin must always remain.")
 
     return "\n".join(lines)
 
@@ -364,6 +391,7 @@ def admins_keyboard(
     admin_items: list[tuple[int, str]],
     candidate: PendingAdminCandidate | None,
     waiting_for_candidate: bool,
+    can_remove_admins: bool,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -377,12 +405,13 @@ def admins_keyboard(
     elif waiting_for_candidate:
         rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data="admin:cancel")])
     else:
-        for admin_id, label in admin_items:
-            rows.append(
-                [
-                    InlineKeyboardButton(text=f"Remove {label}", callback_data=f"admin:remove:{admin_id}")
-                ]
-            )
+        if can_remove_admins:
+            for admin_id, label in admin_items:
+                rows.append(
+                    [
+                        InlineKeyboardButton(text=f"Remove {label}", callback_data=f"admin:remove:{admin_id}")
+                    ]
+                )
         rows.append([InlineKeyboardButton(text="➕ Add", callback_data="admin:add")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
@@ -454,44 +483,6 @@ def codex_keyboard(*, auth_state: CodexAuthState, login_active: bool) -> InlineK
         rows.append([InlineKeyboardButton(text="🔐 Log in", callback_data="codex:login")])
         rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="codex:refresh")])
 
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
-    return _keyboard(rows)
-
-
-def build_whisper_text(*, whisper_state: WhisperState) -> str:
-    lines = [
-        "<b>Whisper</b>",
-        "",
-        f"Status: <code>{html.escape(whisper_state.summary)}</code>",
-        f"Model: <code>{html.escape(whisper_state.model_name)}</code>",
-    ]
-    if whisper_state.package_version:
-        lines.append(f"Package: <code>{html.escape(whisper_state.package_version)}</code>")
-    lines.extend(
-        [
-            "",
-            "Voice messages are transcribed locally and always require confirmation before running Codex.",
-        ]
-    )
-    if whisper_state.details:
-        lines.extend(
-            [
-                "",
-                "<b>Details</b>",
-                f"<pre><code>{html.escape(whisper_state.details)}</code></pre>",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def whisper_keyboard(*, whisper_state: WhisperState, busy: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if busy:
-        rows.append([InlineKeyboardButton(text="⏳ Working…", callback_data="whisper:noop")])
-    elif whisper_state.installed:
-        rows.append([InlineKeyboardButton(text="🗑 Delete Whisper", callback_data="whisper:delete")])
-    else:
-        rows.append([InlineKeyboardButton(text="⬇️ Install Whisper", callback_data="whisper:install")])
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)
 

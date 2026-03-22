@@ -7,6 +7,7 @@
 - Update notices are now more reliable after background service restarts.
 - Model and thinking switches now stay inline on the dashboard and under replies, with the old dedicated model page removed.
 - In-bot updates now reuse the same installer flow as the public `install.sh` command to avoid drift between manual and Telegram updates.
+- Quick model and thinking taps now keep the full dashboard menu intact instead of replacing it with a tiny controls row.
 
 ## 0.1.3
 
