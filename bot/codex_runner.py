@@ -588,6 +588,12 @@ class CodexRunner:
         executable = self.current_executable_path()
         if not executable.exists():
             raise RuntimeError(f"CLI executable not found: {executable}")
+        if sys.platform == "darwin":
+            from bot.app_paths import get_app_paths
+            from bot.launchd import schedule_service_install_launch_agent
+
+            await asyncio.to_thread(schedule_service_install_launch_agent, get_app_paths(), executable)
+            return
         await asyncio.create_subprocess_exec(
             str(executable),
             "service",

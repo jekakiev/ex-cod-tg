@@ -9,6 +9,7 @@
 - In-bot updates now reuse the same installer flow as the public `install.sh` command to avoid drift between manual and Telegram updates.
 - Quick model and thinking taps now keep the full dashboard menu intact instead of replacing it with a tiny controls row.
 - Added a macOS menu bar helper with bot status, start/stop controls, log access, and a launch-at-login toggle.
+- In-bot updates on macOS now hand off the final service reinstall to a separate launchd updater job so new helpers also appear after update.
 
 ## 0.1.3
 

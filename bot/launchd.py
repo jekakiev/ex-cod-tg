@@ -8,6 +8,8 @@ from pathlib import Path
 
 from bot.app_paths import AppPaths
 
+UPDATE_LABEL = "io.excodtg.updater"
+
 
 def install_launch_agent(paths: AppPaths, executable: Path) -> Path:
     if paths.service_kind != "launchd":
@@ -113,6 +115,37 @@ def restart_helper_launch_agent(paths: AppPaths) -> None:
     if not paths.helper_service_file.exists():
         raise RuntimeError("helper launchd service is not installed.")
     kickstart_launch_agent(paths.helper_service_label, check=True)
+
+
+def schedule_service_install_launch_agent(paths: AppPaths, executable: Path) -> Path:
+    if paths.service_kind != "launchd":
+        raise RuntimeError("launchd service management is only available on macOS.")
+
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    updater_plist = paths.config_dir / "service-install-updater.plist"
+    helper_log = paths.helper_log_file or paths.log_file
+    _write_launch_agent(
+        plist_path=updater_plist,
+        plist={
+            "Label": UPDATE_LABEL,
+            "ProgramArguments": [str(executable), "service", "install"],
+            "RunAtLoad": True,
+            "KeepAlive": False,
+            "ProcessType": "Background",
+            "WorkingDirectory": str(Path.home()),
+            "EnvironmentVariables": {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONUNBUFFERED": "1",
+            },
+            "StandardOutPath": str(helper_log),
+            "StandardErrorPath": str(helper_log),
+        },
+    )
+    set_launch_agent_enabled(UPDATE_LABEL, enabled=True)
+    bootstrap_launch_agent(updater_plist)
+    kickstart_launch_agent(UPDATE_LABEL, check=False)
+    return updater_plist
 
 
 def is_launch_agent_loaded(label: str) -> bool:
