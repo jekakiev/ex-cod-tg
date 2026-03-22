@@ -22,6 +22,7 @@ Built for a simple workflow:
 - plain chat messages sent directly to Codex with streaming output
 - optional local Whisper transcription for Telegram voice messages
 - in-app bot update button with release notes after restart
+- macOS menu bar helper with bot status, start/stop controls, logs, and launch-at-login toggle
 - built-in commands: `/ask`, `/fix`, `/diff`, `/log`, `/commit`, `/run`
 - Codex CLI auth screen with login, logout, and refresh
 - automatic first-admin bootstrap on the first `/start`
@@ -47,6 +48,8 @@ After that:
 
 The only thing you need to enter in the terminal is your Telegram bot token.
 
+On macOS, the install also adds a menu bar helper so you can see bot status, open logs, and start or stop the bot from the system tray.
+
 ![ex-cod onboarding](docs/screenshots/ex-cod_onboarding.webp)
 
 ## How It Works
@@ -64,6 +67,7 @@ The only thing you need to enter in the terminal is your Telegram bot token.
 - installs `ex-cod-tg` from GitHub into that environment
 - creates a local `ex-cod-tg` CLI shim in `~/.local/bin`
 - runs `ex-cod-tg service install`
+- on macOS, also installs the menu bar helper so the bot and helper launch together at login
 
 ## Telegram Commands
 

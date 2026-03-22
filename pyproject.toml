@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "aiogram>=3.13,<4.0",
   "python-dotenv>=1.0,<2.0",
+  "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -18,3 +19,6 @@ ex-cod-tg = "bot.cli:main"
 
 [tool.setuptools]
 packages = ["bot", "utils"]
+
+[tool.setuptools.package-data]
+bot = ["assets/*.png"]

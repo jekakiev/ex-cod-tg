@@ -8,6 +8,7 @@ from pathlib import Path
 
 APP_NAME = "ex-cod-tg"
 MAC_SERVICE_LABEL = "io.excodtg.bot"
+MAC_HELPER_LABEL = "io.excodtg.helper"
 LINUX_SERVICE_LABEL = "ex-cod-tg.service"
 
 
@@ -20,9 +21,12 @@ class AppPaths:
     update_notice_file: Path
     logs_dir: Path
     log_file: Path
+    helper_log_file: Path | None
     service_dir: Path
     service_file: Path
     service_label: str
+    helper_service_file: Path | None
+    helper_service_label: str | None
     service_kind: str
 
 
@@ -42,9 +46,12 @@ def get_app_paths() -> AppPaths:
             update_notice_file=config_dir / "update_notice.json",
             logs_dir=logs_dir,
             log_file=logs_dir / "bot.log",
+            helper_log_file=logs_dir / "helper.log",
             service_dir=service_dir,
             service_file=service_dir / f"{MAC_SERVICE_LABEL}.plist",
             service_label=MAC_SERVICE_LABEL,
+            helper_service_file=service_dir / f"{MAC_HELPER_LABEL}.plist",
+            helper_service_label=MAC_HELPER_LABEL,
             service_kind="launchd",
         )
 
@@ -62,9 +69,12 @@ def get_app_paths() -> AppPaths:
             update_notice_file=config_dir / "update_notice.json",
             logs_dir=logs_dir,
             log_file=logs_dir / "bot.log",
+            helper_log_file=None,
             service_dir=service_dir,
             service_file=service_dir / LINUX_SERVICE_LABEL,
             service_label=LINUX_SERVICE_LABEL,
+            helper_service_file=None,
+            helper_service_label=None,
             service_kind="systemd",
         )
 
