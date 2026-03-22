@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- Selected models now come from the live local Codex CLI catalog and are shown two per row.
+- Thinking levels now follow the current model, including `xhigh` (`Very detailed`) where supported.
+- Home screen is lighter and faster, with less status noise and shorter-lived caches for snappier taps.
+
 ## 0.1.2
 
 - Added quick model and thinking switches on the home screen and under each Codex reply.

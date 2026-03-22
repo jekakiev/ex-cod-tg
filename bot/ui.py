@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.codex_runner import BotUpdateState, CodexAuthState, EnvironmentStatus, WhisperState
+from bot.codex_runner import BotUpdateState, CodexAuthState, EnvironmentStatus, WhisperState, normalize_model_slug
 from bot.version import APP_VERSION
 
 
@@ -31,10 +31,24 @@ class PendingVoicePreview:
 
 
 def model_label(value: str) -> str:
+    normalized = normalize_model_slug(value)
     mapping = {
         "gpt-5.4": "5.4",
-        "gpt-5-codex-mini": "5.4 mini",
-        "gpt-5": "5",
+        "gpt-5.4-mini": "5.4 mini",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if normalized.startswith("gpt-"):
+        return normalized.removeprefix("gpt-").replace("-", " ")
+    return normalized
+
+
+def thinking_label(value: str) -> str:
+    mapping = {
+        "low": "Fast",
+        "medium": "Balanced",
+        "high": "Detailed",
+        "xhigh": "Very detailed",
     }
     return mapping.get(value, value)
 
@@ -42,15 +56,14 @@ def model_label(value: str) -> str:
 def build_home_text(
     *,
     environment: EnvironmentStatus,
-    auth_state: CodexAuthState,
     update_state: BotUpdateState,
     active_project_name: str,
     has_active_project: bool,
     project_count: int,
     showing_repo_list: bool,
     showing_branch_list: bool,
+    whisper_summary: str | None,
 ) -> str:
-    codex_line = auth_state.account_summary or auth_state.status_summary
     latest_commit_line = environment.latest_commit_summary or ("not a git repo" if environment.git_repo is False else "unavailable")
     if environment.changed_files_count is None:
         diff_line = "unavailable"
@@ -61,10 +74,10 @@ def build_home_text(
         f"Project: <code>{html.escape(active_project_name)}</code>\n"
         f"Latest commit: <code>{html.escape(latest_commit_line)}</code>\n"
         f"Diff: <code>{html.escape(diff_line)}</code>\n\n"
-        f"Codex auth: <code>{html.escape(codex_line)}</code>\n"
-        f"Whisper: <code>{html.escape(environment.whisper_summary)}</code>\n"
         f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>"
     ]
+    if whisper_summary:
+        lines.insert(-1, f"Whisper: <code>{html.escape(whisper_summary)}</code>\n")
     if update_state.update_available:
         summary = update_state.latest_summary or "A newer commit is available."
         lines.append(f'\n\n<blockquote>Update available: {html.escape(summary)}</blockquote>')
@@ -96,8 +109,8 @@ def build_model_text(
     lines = [
         "<b>Model</b>",
         "",
-        f"Selected model: <code>{html.escape(current_model)}</code>",
-        f"Thinking level: <code>{html.escape(current_thinking_level)}</code>",
+        f"Selected model: <code>{html.escape(model_label(current_model))}</code>",
+        f"Thinking level: <code>{html.escape(thinking_label(current_thinking_level))}</code>",
         "",
         "These settings are used for new Codex tasks started from Telegram.",
     ]
@@ -197,7 +210,7 @@ def home_keyboard(
                     callback_data="quick:model",
                 ),
                 InlineKeyboardButton(
-                    text=f"Thinking: {current_thinking_level}",
+                    text=f"Thinking: {thinking_label(current_thinking_level)}",
                     callback_data="quick:thinking",
                 ),
             ],
@@ -221,7 +234,7 @@ def model_keyboard(
         for index, model_name in enumerate(models):
             current_row.append(
                 InlineKeyboardButton(
-                    text=_truncate_button_label(model_name, limit=24),
+                    text=_truncate_button_label(model_label(model_name), limit=24),
                     callback_data=f"codexmodel:select:{index}",
                 )
             )
@@ -239,7 +252,7 @@ def model_keyboard(
         for index, level in enumerate(thinking_levels):
             current_row.append(
                 InlineKeyboardButton(
-                    text=_truncate_button_label(level, limit=24),
+                    text=_truncate_button_label(thinking_label(level), limit=24),
                     callback_data=f"thinking:select:{index}",
                 )
             )
@@ -254,23 +267,23 @@ def model_keyboard(
     has_models = bool(models) and active_model_index is not None
     model_left = "codexmodel:prev" if has_models and len(models) > 1 else "codexmodel:noop"
     model_right = "codexmodel:next" if has_models and len(models) > 1 else "codexmodel:noop"
-    model_label = models[active_model_index] if has_models else "Choose model"
+    active_model_label = model_label(models[active_model_index]) if has_models else "Choose model"
 
     has_thinking = bool(thinking_levels) and active_thinking_index is not None
     thinking_left = "thinking:prev" if has_thinking and len(thinking_levels) > 1 else "thinking:noop"
     thinking_right = "thinking:next" if has_thinking and len(thinking_levels) > 1 else "thinking:noop"
-    thinking_label = thinking_levels[active_thinking_index] if has_thinking else "Choose thinking"
+    active_thinking_label = thinking_label(thinking_levels[active_thinking_index]) if has_thinking else "Choose thinking"
 
     return _keyboard(
         [
             [
                 InlineKeyboardButton(text="◀️", callback_data=model_left),
-                InlineKeyboardButton(text=_truncate_button_label(model_label, limit=24), callback_data="codexmodel:list"),
+                InlineKeyboardButton(text=_truncate_button_label(active_model_label, limit=24), callback_data="codexmodel:list"),
                 InlineKeyboardButton(text="▶️", callback_data=model_right),
             ],
             [
                 InlineKeyboardButton(text="◀️", callback_data=thinking_left),
-                InlineKeyboardButton(text=_truncate_button_label(thinking_label, limit=24), callback_data="thinking:list"),
+                InlineKeyboardButton(text=_truncate_button_label(active_thinking_label, limit=24), callback_data="thinking:list"),
                 InlineKeyboardButton(text="▶️", callback_data=thinking_right),
             ],
             [InlineKeyboardButton(text="All models", callback_data="codexmodel:list")],
@@ -303,44 +316,58 @@ def settings_keyboard(*, update_busy: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Admins", callback_data="nav:admins"),
             InlineKeyboardButton(text="Codex CLI", callback_data="nav:codex"),
         ],
-        [InlineKeyboardButton(text="Model & Thinking", callback_data="nav:model")],
-        [InlineKeyboardButton(text="Selected models", callback_data="nav:selected_models")],
-        [InlineKeyboardButton(text="Whisper", callback_data="nav:whisper")],
+        [
+            InlineKeyboardButton(text="Selected models", callback_data="nav:selected_models"),
+            InlineKeyboardButton(text="Whisper", callback_data="nav:whisper"),
+        ],
     ]
     if update_busy:
-        rows.append([InlineKeyboardButton(text="⏳ Updating bot…", callback_data="update:noop")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="⏳ Updating bot…", callback_data="update:noop"),
+                InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
+            ]
+        )
     else:
-        rows.append([InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run")])
-    rows.append([InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run"),
+                InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
+            ]
+        )
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")])
     return _keyboard(rows)
 
 
 def build_selected_models_text(*, selected_models: list[str]) -> str:
-    lines = [
-        "<b>Selected models</b>",
-        "",
-        "Choose which models should be used in quick model switching.",
-        "",
-    ]
-    for model in selected_models:
-        lines.append(f"• <code>{html.escape(model_label(model))}</code>")
-    return "\n".join(lines)
+    selected_text = ", ".join(model_label(model) for model in selected_models) or "None"
+    return "\n".join(
+        [
+            "<b>Selected models</b>",
+            "",
+            "Choose which models should be used in quick model switching.",
+            f"Current selection: <code>{html.escape(selected_text)}</code>",
+        ]
+    )
 
 
 def selected_models_keyboard(*, available_models: list[str], selected_models: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     selected_set = set(selected_models)
+    current_row: list[InlineKeyboardButton] = []
     for model in available_models:
         prefix = "✅" if model in selected_set else "⬜️"
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{prefix} {model_label(model)}",
-                    callback_data=f"selected_models:toggle:{model}",
-                )
-            ]
+        current_row.append(
+            InlineKeyboardButton(
+                text=f"{prefix} {model_label(model)}",
+                callback_data=f"selected_models:toggle:{model}",
+            )
         )
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)
 
@@ -587,7 +614,7 @@ def response_controls_keyboard(*, current_model: str, current_thinking_level: st
                     callback_data="quick:model",
                 ),
                 InlineKeyboardButton(
-                    text=f"Thinking: {current_thinking_level}",
+                    text=f"Thinking: {thinking_label(current_thinking_level)}",
                     callback_data="quick:thinking",
                 ),
             ]

@@ -27,6 +27,11 @@ WHISPER_PIP_PACKAGE = "faster-whisper"
 SELF_REPO_URL = "git+https://github.com/jekakiev/ex-cod-tg.git@main"
 GITHUB_COMMITS_API = "https://api.github.com/repos/jekakiev/ex-cod-tg/commits/"
 RAW_GITHUB_BASE = "https://raw.githubusercontent.com/jekakiev/ex-cod-tg"
+MODEL_ALIAS_MAP = {
+    "gpt-5-codex-mini": "gpt-5.4-mini",
+}
+DEFAULT_SELECTED_MODELS = ("gpt-5.4", "gpt-5.4-mini")
+DEFAULT_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
 
 
 @dataclass(slots=True)
@@ -56,9 +61,23 @@ class EnvironmentStatus:
     git_branch: str | None
     latest_commit_summary: str | None
     changed_files_count: int | None
-    whisper_summary: str
     active_job: str | None
     queued_jobs: int
+
+
+@dataclass(slots=True)
+class CodexModelInfo:
+    slug: str
+    display_name: str
+    default_reasoning_level: str
+    supported_reasoning_levels: tuple[str, ...]
+
+
+def normalize_model_slug(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return normalized
+    return MODEL_ALIAS_MAP.get(normalized, normalized)
 
 
 @dataclass(slots=True)
@@ -192,6 +211,9 @@ class CodexRunner:
 
     def codex_auth_file(self) -> Path:
         return Path.home() / ".codex" / "auth.json"
+
+    def codex_models_cache_file(self) -> Path:
+        return Path.home() / ".codex" / "models_cache.json"
 
     def whisper_model_name(self) -> str:
         return WHISPER_MODEL_NAME
@@ -332,7 +354,6 @@ class CodexRunner:
         git_branch: str | None = None
         latest_commit_summary: str | None = None
         changed_files_count: int | None = None
-        whisper_state = await self.collect_whisper_state()
 
         if self.config.working_dir_exists:
             probe = await self.run_git_command(
@@ -374,10 +395,54 @@ class CodexRunner:
             git_branch=git_branch,
             latest_commit_summary=latest_commit_summary,
             changed_files_count=changed_files_count,
-            whisper_summary=whisper_state.summary,
             active_job=active_job,
             queued_jobs=queued_jobs,
         )
+
+    def collect_model_catalog(self) -> list[CodexModelInfo]:
+        cache_file = self.codex_models_cache_file()
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return self._fallback_model_catalog()
+
+        raw_models = payload.get("models")
+        if not isinstance(raw_models, list):
+            return self._fallback_model_catalog()
+
+        catalog: list[CodexModelInfo] = []
+        seen: set[str] = set()
+        for item in raw_models:
+            if not isinstance(item, dict):
+                continue
+            if item.get("visibility") not in (None, "list"):
+                continue
+            slug = normalize_model_slug(str(item.get("slug") or "").strip())
+            if not slug or slug in seen:
+                continue
+            display_name = str(item.get("display_name") or slug).strip() or slug
+            default_reasoning_level = str(item.get("default_reasoning_level") or "medium").strip() or "medium"
+            raw_levels = item.get("supported_reasoning_levels")
+            supported_levels: list[str] = []
+            if isinstance(raw_levels, list):
+                for raw_level in raw_levels:
+                    if not isinstance(raw_level, dict):
+                        continue
+                    effort = str(raw_level.get("effort") or "").strip()
+                    if effort:
+                        supported_levels.append(effort)
+            normalized_levels = tuple(level for level in supported_levels if level) or DEFAULT_REASONING_LEVELS
+            catalog.append(
+                CodexModelInfo(
+                    slug=slug,
+                    display_name=display_name,
+                    default_reasoning_level=default_reasoning_level,
+                    supported_reasoning_levels=normalized_levels,
+                )
+            )
+            seen.add(slug)
+
+        return catalog or self._fallback_model_catalog()
 
     async def install_whisper(self) -> list[tuple[str, CommandResult]]:
         install_result = await self._run_process(
@@ -852,6 +917,17 @@ class CodexRunner:
             duration_seconds=0.0,
             error=message,
         )
+
+    def _fallback_model_catalog(self) -> list[CodexModelInfo]:
+        return [
+            CodexModelInfo(
+                slug=slug,
+                display_name=slug,
+                default_reasoning_level="medium",
+                supported_reasoning_levels=DEFAULT_REASONING_LEVELS,
+            )
+            for slug in DEFAULT_SELECTED_MODELS
+        ]
 
     def _read_installed_commit(self) -> str | None:
         try:

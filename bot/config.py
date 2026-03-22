@@ -7,6 +7,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from bot.codex_runner import DEFAULT_SELECTED_MODELS, normalize_model_slug
 from bot.workspaces import choose_active_project, detect_workspaces_root
 
 
@@ -108,10 +109,12 @@ class AppConfig:
             workspaces_root=workspaces_root,
             active_project_path=active_project_path,
             codex_bin=merged_values.get("CODEX_BIN", "codex").strip() or "codex",
-            codex_model=merged_values.get("CODEX_MODEL", default_codex_model).strip() or default_codex_model,
+            codex_model=normalize_model_slug(
+                merged_values.get("CODEX_MODEL", default_codex_model).strip() or default_codex_model
+            ),
             codex_selected_models=_parse_selected_models(
                 merged_values.get("CODEX_SELECTED_MODELS", ""),
-                fallback=(default_codex_model, "gpt-5-codex-mini"),
+                fallback=(normalize_model_slug(default_codex_model), *DEFAULT_SELECTED_MODELS[1:]),
             ),
             codex_thinking_level=merged_values.get("CODEX_THINKING_LEVEL", default_thinking_level).strip() or default_thinking_level,
             command_timeout_seconds=_parse_positive_int_from_values(
@@ -198,5 +201,5 @@ def _load_default_codex_preferences() -> tuple[str, str]:
 
 
 def _parse_selected_models(raw_value: str, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
-    models = tuple(item.strip() for item in raw_value.split(",") if item.strip())
+    models = tuple(normalize_model_slug(item) for item in raw_value.split(",") if item.strip())
     return models or fallback

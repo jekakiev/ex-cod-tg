@@ -11,7 +11,7 @@ DEFAULT_CONFIG_VALUES = {
     "ACTIVE_PROJECT_PATH": "",
     "CODEX_BIN": "codex",
     "CODEX_MODEL": "gpt-5.4",
-    "CODEX_SELECTED_MODELS": "gpt-5.4,gpt-5-codex-mini",
+    "CODEX_SELECTED_MODELS": "gpt-5.4,gpt-5.4-mini",
     "CODEX_THINKING_LEVEL": "high",
     "COMMAND_TIMEOUT_SECONDS": "900",
     "SHELL_TIMEOUT_SECONDS": "120",

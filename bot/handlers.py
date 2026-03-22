@@ -18,7 +18,18 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.chat_action import ChatActionSender
 
-from bot.codex_runner import AsyncCommandQueue, BotUpdateState, CodexRunner
+from bot.codex_runner import (
+    DEFAULT_REASONING_LEVELS,
+    DEFAULT_SELECTED_MODELS,
+    AsyncCommandQueue,
+    BotUpdateState,
+    CodexAuthState,
+    CodexModelInfo,
+    CodexRunner,
+    EnvironmentStatus,
+    WhisperState,
+    normalize_model_slug,
+)
 from bot.config_store import (
     add_admin_id,
     remove_admin_id,
@@ -54,6 +65,7 @@ from bot.ui import (
     response_controls_keyboard,
     selected_models_keyboard,
     settings_keyboard,
+    thinking_label,
     voice_preview_keyboard,
     whisper_keyboard,
     workspaces_root_keyboard,
@@ -70,8 +82,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 router = Router(name=__name__)
 UPDATE_CHECK_TTL_SECONDS = 120
-AVAILABLE_CODEX_MODELS = ["gpt-5.4", "gpt-5", "gpt-5-codex-mini"]
-AVAILABLE_THINKING_LEVELS = ["low", "medium", "high"]
+STATUS_CACHE_TTL_SECONDS = 5
+MODEL_CATALOG_CACHE_TTL_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -141,6 +153,14 @@ class AppContext:
     flash_message: str | None = None
     cached_update_state: BotUpdateState | None = None
     update_checked_at: float = 0.0
+    cached_environment_status: EnvironmentStatus | None = None
+    environment_checked_at: float = 0.0
+    cached_auth_state: CodexAuthState | None = None
+    auth_checked_at: float = 0.0
+    cached_whisper_state: WhisperState | None = None
+    whisper_checked_at: float = 0.0
+    cached_model_catalog: list[CodexModelInfo] | None = None
+    model_catalog_checked_at: float = 0.0
 
 
 HELP_TEXT = """
@@ -537,7 +557,11 @@ async def codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContex
     current_index = models.index(app_context.config.codex_model) if app_context.config.codex_model in models else 0
     direction = -1 if query.data == "codexmodel:prev" else 1
     next_model = models[(current_index + direction) % len(models)]
-    await _set_codex_preferences(app_context, codex_model=next_model)
+    await _set_codex_preferences(
+        app_context,
+        codex_model=next_model,
+        thinking_level=_effective_thinking_level(app_context, next_model),
+    )
     await _show_dashboard_from_callback(query, app_context, page="model")
     await query.answer(f"Model: {model_label(next_model)}")
 
@@ -547,16 +571,14 @@ async def thinking_cycle_callback(query: CallbackQuery, app_context: AppContext)
     if not await _ensure_authorized_callback(query, app_context):
         return
 
-    current_index = (
-        AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
-        if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
-        else 0
-    )
+    levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
+    current_level = _effective_thinking_level(app_context, app_context.config.codex_model)
+    current_index = levels.index(current_level) if current_level in levels else 0
     direction = -1 if query.data == "thinking:prev" else 1
-    next_level = AVAILABLE_THINKING_LEVELS[(current_index + direction) % len(AVAILABLE_THINKING_LEVELS)]
+    next_level = levels[(current_index + direction) % len(levels)]
     await _set_codex_preferences(app_context, thinking_level=next_level)
     await _show_dashboard_from_callback(query, app_context, page="model")
-    await query.answer(f"Thinking: {next_level}")
+    await query.answer(f"Thinking: {thinking_label(next_level)}")
 
 
 @router.callback_query(F.data.startswith("branch:select:"))
@@ -601,7 +623,11 @@ async def codexmodel_select_callback(query: CallbackQuery, app_context: AppConte
         return
 
     target_model = models[index]
-    await _set_codex_preferences(app_context, codex_model=target_model)
+    await _set_codex_preferences(
+        app_context,
+        codex_model=target_model,
+        thinking_level=_effective_thinking_level(app_context, target_model),
+    )
     await _show_dashboard_from_callback(query, app_context, page="model")
     await query.answer(f"Model: {model_label(target_model)}")
 
@@ -616,15 +642,16 @@ async def thinking_select_callback(query: CallbackQuery, app_context: AppContext
         await query.answer("Invalid thinking level.", show_alert=True)
         return
 
+    levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
     index = int(raw_index)
-    if index < 0 or index >= len(AVAILABLE_THINKING_LEVELS):
+    if index < 0 or index >= len(levels):
         await query.answer("Thinking list is out of date.", show_alert=True)
         return
 
-    target_level = AVAILABLE_THINKING_LEVELS[index]
+    target_level = levels[index]
     await _set_codex_preferences(app_context, thinking_level=target_level)
     await _show_dashboard_from_callback(query, app_context, page="model")
-    await query.answer(f"Thinking: {target_level}")
+    await query.answer(f"Thinking: {thinking_label(target_level)}")
 
 
 @router.callback_query(F.data == "quick:model")
@@ -632,7 +659,11 @@ async def quick_model_callback(query: CallbackQuery, app_context: AppContext) ->
     if not await _ensure_authorized_callback(query, app_context):
         return
     next_model = _cycle_current_model(app_context)
-    await _set_codex_preferences(app_context, codex_model=next_model)
+    await _set_codex_preferences(
+        app_context,
+        codex_model=next_model,
+        thinking_level=_effective_thinking_level(app_context, next_model),
+    )
     await _refresh_quick_controls_target(query, app_context)
     await query.answer(f"Model: {model_label(next_model)}")
 
@@ -644,15 +675,15 @@ async def quick_thinking_callback(query: CallbackQuery, app_context: AppContext)
     next_level = _cycle_thinking_level(app_context)
     await _set_codex_preferences(app_context, thinking_level=next_level)
     await _refresh_quick_controls_target(query, app_context)
-    await query.answer(f"Thinking: {next_level}")
+    await query.answer(f"Thinking: {thinking_label(next_level)}")
 
 
 @router.callback_query(F.data.startswith("selected_models:toggle:"))
 async def selected_models_toggle_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
-    target_model = query.data.rsplit(":", 1)[1]
-    if target_model not in AVAILABLE_CODEX_MODELS:
+    target_model = normalize_model_slug(query.data.rsplit(":", 1)[1])
+    if target_model not in set(_available_model_slugs(app_context)):
         await query.answer("Unknown model.", show_alert=True)
         return
 
@@ -671,6 +702,7 @@ async def selected_models_toggle_callback(query: CallbackQuery, app_context: App
         app_context,
         codex_model=next_current_model,
         selected_models=selected,
+        thinking_level=_effective_thinking_level(app_context, next_current_model),
     )
     await _show_dashboard_from_callback(query, app_context, page="selected_models")
     await query.answer("Selected models updated.")
@@ -765,6 +797,8 @@ async def admin_remove_callback(query: CallbackQuery, app_context: AppContext) -
 async def codex_refresh_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
+    app_context.cached_auth_state = None
+    app_context.auth_checked_at = 0.0
     await _show_dashboard_from_callback(query, app_context, page="codex")
     await query.answer("Refreshed.")
 
@@ -828,6 +862,8 @@ async def codex_cancel_login_callback(query: CallbackQuery, app_context: AppCont
         await session.process.wait()
     session.completed = True
     session.returncode = session.process.returncode
+    app_context.cached_auth_state = None
+    app_context.auth_checked_at = 0.0
 
     await _show_dashboard_from_callback(query, app_context, page="codex")
     await query.answer("Login flow cancelled.")
@@ -845,6 +881,8 @@ async def codex_logout_callback(query: CallbackQuery, app_context: AppContext) -
     async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
         result = await app_context.runner.run_codex_logout()
 
+    app_context.cached_auth_state = None
+    app_context.auth_checked_at = 0.0
     await _show_dashboard_from_callback(query, app_context, page="codex")
     if result.ok:
         await query.answer("Logged out.")
@@ -876,6 +914,10 @@ async def whisper_install_callback(query: CallbackQuery, app_context: AppContext
         )
 
     install_ok = all(result.ok for _, result in results)
+    app_context.cached_whisper_state = None
+    app_context.whisper_checked_at = 0.0
+    app_context.cached_environment_status = None
+    app_context.environment_checked_at = 0.0
     app_context.flash_message = (
         f"✅ Whisper installed ({app_context.runner.whisper_model_name()})"
         if install_ok
@@ -900,6 +942,10 @@ async def whisper_delete_callback(query: CallbackQuery, app_context: AppContext)
         )
 
     uninstall_ok = all(result.ok for _, result in results)
+    app_context.cached_whisper_state = None
+    app_context.whisper_checked_at = 0.0
+    app_context.cached_environment_status = None
+    app_context.environment_checked_at = 0.0
     app_context.flash_message = (
         "✅ Whisper removed" if uninstall_ok else "❌ Whisper removal failed"
     )
@@ -1132,9 +1178,108 @@ async def _get_bot_update_state(app_context: AppContext, *, force: bool = False)
     return update_state
 
 
+async def _get_environment_status(app_context: AppContext, *, force: bool = False) -> EnvironmentStatus:
+    now = time.monotonic()
+    if (
+        not force
+        and app_context.cached_environment_status is not None
+        and now - app_context.environment_checked_at < STATUS_CACHE_TTL_SECONDS
+    ):
+        return app_context.cached_environment_status
+
+    environment = await app_context.runner.collect_environment_status(
+        active_job=app_context.queue.active_label,
+        queued_jobs=app_context.queue.waiting_count,
+    )
+    app_context.cached_environment_status = environment
+    app_context.environment_checked_at = now
+    return environment
+
+
+async def _get_auth_state(app_context: AppContext, *, force: bool = False) -> CodexAuthState:
+    now = time.monotonic()
+    if (
+        not force
+        and app_context.cached_auth_state is not None
+        and now - app_context.auth_checked_at < STATUS_CACHE_TTL_SECONDS
+    ):
+        return app_context.cached_auth_state
+
+    auth_state = await app_context.runner.collect_codex_auth_state()
+    app_context.cached_auth_state = auth_state
+    app_context.auth_checked_at = now
+    return auth_state
+
+
+async def _get_whisper_state(app_context: AppContext, *, force: bool = False) -> WhisperState:
+    now = time.monotonic()
+    if (
+        not force
+        and app_context.cached_whisper_state is not None
+        and now - app_context.whisper_checked_at < STATUS_CACHE_TTL_SECONDS
+    ):
+        return app_context.cached_whisper_state
+
+    whisper_state = await app_context.runner.collect_whisper_state()
+    app_context.cached_whisper_state = whisper_state
+    app_context.whisper_checked_at = now
+    return whisper_state
+
+
+def _get_model_catalog(app_context: AppContext, *, force: bool = False) -> list[CodexModelInfo]:
+    now = time.monotonic()
+    if (
+        not force
+        and app_context.cached_model_catalog is not None
+        and now - app_context.model_catalog_checked_at < MODEL_CATALOG_CACHE_TTL_SECONDS
+    ):
+        return app_context.cached_model_catalog
+
+    catalog = app_context.runner.collect_model_catalog()
+    app_context.cached_model_catalog = catalog
+    app_context.model_catalog_checked_at = now
+    return catalog
+
+
+def _available_model_slugs(app_context: AppContext) -> list[str]:
+    return [item.slug for item in _get_model_catalog(app_context)] or list(DEFAULT_SELECTED_MODELS)
+
+
+def _model_info(app_context: AppContext, model_slug: str) -> CodexModelInfo | None:
+    normalized = normalize_model_slug(model_slug)
+    for item in _get_model_catalog(app_context):
+        if item.slug == normalized:
+            return item
+    return None
+
+
+def _thinking_levels_for_model(app_context: AppContext, model_slug: str) -> list[str]:
+    info = _model_info(app_context, model_slug)
+    if info is None:
+        return list(DEFAULT_REASONING_LEVELS)
+    return list(info.supported_reasoning_levels) or list(DEFAULT_REASONING_LEVELS)
+
+
+def _default_thinking_for_model(app_context: AppContext, model_slug: str) -> str:
+    info = _model_info(app_context, model_slug)
+    if info is None or not info.default_reasoning_level:
+        return DEFAULT_REASONING_LEVELS[1]
+    return info.default_reasoning_level
+
+
+def _effective_thinking_level(app_context: AppContext, model_slug: str) -> str:
+    current = app_context.config.codex_thinking_level
+    levels = _thinking_levels_for_model(app_context, model_slug)
+    if current in levels:
+        return current
+    default_level = _default_thinking_for_model(app_context, model_slug)
+    return default_level if default_level in levels else levels[0]
+
+
 def _effective_selected_models(app_context: AppContext) -> list[str]:
-    selected = [model for model in app_context.config.codex_selected_models if model in AVAILABLE_CODEX_MODELS]
-    return selected or ["gpt-5.4", "gpt-5-codex-mini"]
+    available_models = set(_available_model_slugs(app_context))
+    selected = [normalize_model_slug(model) for model in app_context.config.codex_selected_models if normalize_model_slug(model) in available_models]
+    return selected or [model for model in DEFAULT_SELECTED_MODELS if model in available_models] or _available_model_slugs(app_context)[:2]
 
 
 def _cycle_current_model(app_context: AppContext) -> str:
@@ -1145,9 +1290,10 @@ def _cycle_current_model(app_context: AppContext) -> str:
 
 
 def _cycle_thinking_level(app_context: AppContext) -> str:
-    current = app_context.config.codex_thinking_level
-    current_index = AVAILABLE_THINKING_LEVELS.index(current) if current in AVAILABLE_THINKING_LEVELS else 0
-    return AVAILABLE_THINKING_LEVELS[(current_index + 1) % len(AVAILABLE_THINKING_LEVELS)]
+    levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
+    current = _effective_thinking_level(app_context, app_context.config.codex_model)
+    current_index = levels.index(current) if current in levels else 0
+    return levels[(current_index + 1) % len(levels)]
 
 
 def _active_project_index(app_context: AppContext, projects: list[WorkspaceProject]) -> int | None:
@@ -1165,6 +1311,10 @@ async def _set_active_project(app_context: AppContext, project_path: Path) -> No
         active_project_path=resolved,
     )
     object.__setattr__(app_context.config, "active_project_path", resolved)
+    app_context.cached_environment_status = None
+    app_context.environment_checked_at = 0.0
+    app_context.cached_auth_state = None
+    app_context.auth_checked_at = 0.0
 
 
 async def _set_codex_preferences(
@@ -1174,16 +1324,18 @@ async def _set_codex_preferences(
     selected_models: list[str] | None = None,
     thinking_level: str | None = None,
 ) -> None:
+    normalized_model = normalize_model_slug(codex_model) if codex_model is not None else None
+    normalized_selected = [normalize_model_slug(item) for item in selected_models] if selected_models is not None else None
     update_codex_preferences(
         app_context.config.config_file,
-        codex_model=codex_model,
-        selected_models=selected_models,
+        codex_model=normalized_model,
+        selected_models=normalized_selected,
         thinking_level=thinking_level,
     )
-    if codex_model is not None:
-        object.__setattr__(app_context.config, "codex_model", codex_model)
-    if selected_models is not None:
-        object.__setattr__(app_context.config, "codex_selected_models", tuple(selected_models))
+    if normalized_model is not None:
+        object.__setattr__(app_context.config, "codex_model", normalized_model)
+    if normalized_selected is not None:
+        object.__setattr__(app_context.config, "codex_selected_models", tuple(normalized_selected))
     if thinking_level is not None:
         object.__setattr__(app_context.config, "codex_thinking_level", thinking_level)
 
@@ -1237,6 +1389,10 @@ async def _set_workspaces_root(app_context: AppContext, root_path: Path) -> None
     )
     object.__setattr__(app_context.config, "workspaces_root", resolved_root)
     object.__setattr__(app_context.config, "active_project_path", active_project)
+    app_context.cached_environment_status = None
+    app_context.environment_checked_at = 0.0
+    app_context.cached_auth_state = None
+    app_context.auth_checked_at = 0.0
 
 
 async def _handle_pending_workspaces_root_message(message: Message, app_context: AppContext) -> bool:
@@ -1348,7 +1504,7 @@ async def _run_codex_chat_request(
         ),
         reply_markup=response_controls_keyboard(
             current_model=app_context.config.codex_model,
-            current_thinking_level=app_context.config.codex_thinking_level,
+            current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
         ),
     )
 
@@ -1372,7 +1528,7 @@ async def _run_codex_chat_request(
                 ),
                 reply_markup=response_controls_keyboard(
                     current_model=app_context.config.codex_model,
-                    current_thinking_level=app_context.config.codex_thinking_level,
+                    current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
                 ),
             )
         else:
@@ -1384,7 +1540,7 @@ async def _run_codex_chat_request(
                 ),
                 reply_markup=response_controls_keyboard(
                     current_model=app_context.config.codex_model,
-                    current_thinking_level=app_context.config.codex_thinking_level,
+                    current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
                 ),
             )
     else:
@@ -1398,7 +1554,7 @@ async def _run_codex_chat_request(
             ),
             reply_markup=response_controls_keyboard(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
             ),
         )
 
@@ -1407,7 +1563,7 @@ async def _handle_voice_message(message: Message, app_context: AppContext) -> No
     if message.voice is None or message.from_user is None:
         return
 
-    whisper_state = await app_context.runner.collect_whisper_state()
+    whisper_state = await _get_whisper_state(app_context)
     if not whisper_state.installed:
         await message.reply("Whisper is not installed yet. Open Settings → Whisper and install it first.")
         return
@@ -1495,7 +1651,7 @@ async def _execute_codex_chat_stream(
             ),
             reply_markup=response_controls_keyboard(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
             ),
         )
         last_edit_at = now
@@ -1592,16 +1748,11 @@ async def _refresh_quick_controls_target(query: CallbackQuery, app_context: AppC
     if query.message is None:
         return
 
-    dashboard = app_context.dashboards.get(query.message.chat.id)
-    if dashboard and dashboard.message_id == query.message.message_id:
-        await _show_dashboard_from_callback(query, app_context, page="home")
-        return
-
     try:
         await query.message.edit_reply_markup(
             reply_markup=response_controls_keyboard(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
             )
         )
     except TelegramBadRequest as exc:
@@ -1627,25 +1778,25 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
     active_index = _active_project_index(app_context, projects)
     branch_names, current_branch = await _git_branches_for_active_project(app_context)
     active_branch_index = branch_names.index(current_branch) if current_branch in branch_names else None
+    selected_models = _effective_selected_models(app_context)
+    thinking_levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
+    active_thinking_level = _effective_thinking_level(app_context, app_context.config.codex_model)
 
     if page == "home":
-        environment = await app_context.runner.collect_environment_status(
-            active_job=app_context.queue.active_label,
-            queued_jobs=app_context.queue.waiting_count,
-        )
-        auth_state = await app_context.runner.collect_codex_auth_state()
+        environment = await _get_environment_status(app_context)
+        whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         flash_message = app_context.flash_message
         app_context.flash_message = None
         text = build_home_text(
             environment=environment,
-            auth_state=auth_state,
             update_state=update_state,
             active_project_name=project_name(app_context.config.working_dir) if active_index is not None else "No repo selected",
             has_active_project=active_index is not None,
             project_count=len(projects),
             showing_repo_list=False,
             showing_branch_list=False,
+            whisper_summary=whisper_state.summary if whisper_state.installed else None,
         )
         if flash_message:
             text = f"{text}\n\n<blockquote>{flash_message}</blockquote>"
@@ -1657,26 +1808,23 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             active_branch_index=active_branch_index,
             showing_branch_list=False,
             current_model=app_context.config.codex_model,
-            current_thinking_level=app_context.config.codex_thinking_level,
+            current_thinking_level=active_thinking_level,
         )
 
     if page == "repos":
-        environment = await app_context.runner.collect_environment_status(
-            active_job=app_context.queue.active_label,
-            queued_jobs=app_context.queue.waiting_count,
-        )
-        auth_state = await app_context.runner.collect_codex_auth_state()
+        environment = await _get_environment_status(app_context)
+        whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         return (
             build_home_text(
                 environment=environment,
-                auth_state=auth_state,
                 update_state=update_state,
                 active_project_name=project_name(app_context.config.working_dir) if active_index is not None else "No repo selected",
                 has_active_project=active_index is not None,
                 project_count=len(projects),
                 showing_repo_list=True,
                 showing_branch_list=False,
+                whisper_summary=whisper_state.summary if whisper_state.installed else None,
             ),
             home_keyboard(
                 project_names=project_names,
@@ -1686,27 +1834,24 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 active_branch_index=active_branch_index,
                 showing_branch_list=False,
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=active_thinking_level,
             ),
         )
 
     if page == "branches":
-        environment = await app_context.runner.collect_environment_status(
-            active_job=app_context.queue.active_label,
-            queued_jobs=app_context.queue.waiting_count,
-        )
-        auth_state = await app_context.runner.collect_codex_auth_state()
+        environment = await _get_environment_status(app_context)
+        whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         return (
             build_home_text(
                 environment=environment,
-                auth_state=auth_state,
                 update_state=update_state,
                 active_project_name=project_name(app_context.config.working_dir) if active_index is not None else "No repo selected",
                 has_active_project=active_index is not None,
                 project_count=len(projects),
                 showing_repo_list=False,
                 showing_branch_list=True,
+                whisper_summary=whisper_state.summary if whisper_state.installed else None,
             ),
             home_keyboard(
                 project_names=project_names,
@@ -1716,7 +1861,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 active_branch_index=active_branch_index,
                 showing_branch_list=True,
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=active_thinking_level,
             ),
         )
 
@@ -1724,18 +1869,18 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         return (
             build_model_text(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=active_thinking_level,
                 showing_model_list=False,
                 showing_thinking_list=False,
             ),
             model_keyboard(
-                models=_effective_selected_models(app_context),
-                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
-                if app_context.config.codex_model in _effective_selected_models(app_context)
+                models=selected_models,
+                active_model_index=selected_models.index(app_context.config.codex_model)
+                if app_context.config.codex_model in selected_models
                 else None,
-                thinking_levels=AVAILABLE_THINKING_LEVELS,
-                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
-                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                thinking_levels=thinking_levels,
+                active_thinking_index=thinking_levels.index(active_thinking_level)
+                if active_thinking_level in thinking_levels
                 else None,
                 showing_model_list=False,
                 showing_thinking_list=False,
@@ -1746,18 +1891,18 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         return (
             build_model_text(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=active_thinking_level,
                 showing_model_list=True,
                 showing_thinking_list=False,
             ),
             model_keyboard(
-                models=_effective_selected_models(app_context),
-                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
-                if app_context.config.codex_model in _effective_selected_models(app_context)
+                models=selected_models,
+                active_model_index=selected_models.index(app_context.config.codex_model)
+                if app_context.config.codex_model in selected_models
                 else None,
-                thinking_levels=AVAILABLE_THINKING_LEVELS,
-                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
-                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                thinking_levels=thinking_levels,
+                active_thinking_index=thinking_levels.index(active_thinking_level)
+                if active_thinking_level in thinking_levels
                 else None,
                 showing_model_list=True,
                 showing_thinking_list=False,
@@ -1768,18 +1913,18 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         return (
             build_model_text(
                 current_model=app_context.config.codex_model,
-                current_thinking_level=app_context.config.codex_thinking_level,
+                current_thinking_level=active_thinking_level,
                 showing_model_list=False,
                 showing_thinking_list=True,
             ),
             model_keyboard(
-                models=_effective_selected_models(app_context),
-                active_model_index=_effective_selected_models(app_context).index(app_context.config.codex_model)
-                if app_context.config.codex_model in _effective_selected_models(app_context)
+                models=selected_models,
+                active_model_index=selected_models.index(app_context.config.codex_model)
+                if app_context.config.codex_model in selected_models
                 else None,
-                thinking_levels=AVAILABLE_THINKING_LEVELS,
-                active_thinking_index=AVAILABLE_THINKING_LEVELS.index(app_context.config.codex_thinking_level)
-                if app_context.config.codex_thinking_level in AVAILABLE_THINKING_LEVELS
+                thinking_levels=thinking_levels,
+                active_thinking_index=thinking_levels.index(active_thinking_level)
+                if active_thinking_level in thinking_levels
                 else None,
                 showing_model_list=False,
                 showing_thinking_list=True,
@@ -1787,8 +1932,8 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "settings":
-        auth_state = await app_context.runner.collect_codex_auth_state()
-        whisper_state = await app_context.runner.collect_whisper_state()
+        auth_state = await _get_auth_state(app_context)
+        whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         return (
             build_settings_text(
@@ -1803,11 +1948,10 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "selected_models":
-        selected_models = _effective_selected_models(app_context)
         return (
             build_selected_models_text(selected_models=selected_models),
             selected_models_keyboard(
-                available_models=AVAILABLE_CODEX_MODELS,
+                available_models=_available_model_slugs(app_context),
                 selected_models=selected_models,
             ),
         )
@@ -1848,7 +1992,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "codex":
-        auth_state = await app_context.runner.collect_codex_auth_state()
+        auth_state = await _get_auth_state(app_context)
         session = app_context.codex_login_session
         device_auth = _extract_device_auth_view(session.render_output() if session else None)
         login_active = bool(session and not session.completed)
@@ -1862,7 +2006,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "whisper":
-        whisper_state = await app_context.runner.collect_whisper_state()
+        whisper_state = await _get_whisper_state(app_context, force=True)
         busy = bool(app_context.queue.active_label and app_context.queue.active_label.startswith("whisper "))
         text = build_whisper_text(whisper_state=whisper_state)
         flash_message = app_context.flash_message
@@ -1879,7 +2023,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         active_branch_index=None,
         showing_branch_list=False,
         current_model=app_context.config.codex_model,
-        current_thinking_level=app_context.config.codex_thinking_level,
+        current_thinking_level=active_thinking_level,
     )
 
 
@@ -1907,6 +2051,8 @@ async def _monitor_codex_login_session(
     finally:
         session.completed = True
         final_auth_state = await app_context.runner.collect_codex_auth_state()
+        app_context.cached_auth_state = final_auth_state
+        app_context.auth_checked_at = time.monotonic()
         if not initial_auth_state.logged_in and final_auth_state.logged_in:
             app_context.flash_message = "✅ Successfully authorized"
             await _refresh_dashboard_for_chat(
