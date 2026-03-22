@@ -14,7 +14,7 @@ from aiogram.types import BotCommand
 from bot.app_paths import get_app_paths
 from bot.codex_runner import AsyncCommandQueue, CodexRunner
 from bot.config import AppConfig, ConfigError
-from bot.handlers import AppContext, router
+from bot.handlers import AppContext, router, send_fresh_dashboard_for_chat
 from bot.update_notice_store import clear_update_notice, load_update_notice
 
 
@@ -76,14 +76,14 @@ async def run_bot(config: AppConfig, *, log_file: Path) -> None:
 
     try:
         await bot.set_my_commands(BOT_COMMANDS)
-        await _send_pending_update_notice(bot, paths.update_notice_file)
+        await _send_pending_update_notice(bot, app_context, paths.update_notice_file)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         await queue.shutdown()
         await bot.session.close()
 
 
-async def _send_pending_update_notice(bot: Bot, notice_file: Path) -> None:
+async def _send_pending_update_notice(bot: Bot, app_context: AppContext, notice_file: Path) -> None:
     notice = load_update_notice(notice_file)
     if notice is None:
         return
@@ -99,6 +99,13 @@ async def _send_pending_update_notice(bot: Bot, notice_file: Path) -> None:
     text = "\n".join(lines)
     try:
         await bot.send_message(notice.chat_id, text)
+        await send_fresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=notice.chat_id,
+            user_id=notice.user_id,
+            page="home",
+        )
         clear_update_notice(notice_file)
     except Exception:
         logging.getLogger(__name__).exception("Failed to deliver post-update notice.")

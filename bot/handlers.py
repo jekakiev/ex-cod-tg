@@ -148,6 +148,14 @@ class BotUpdateProgress:
 
 
 @dataclass(slots=True)
+class WhisperProgress:
+    in_progress: bool = False
+    percent: int = 0
+    status_text: str = ""
+    error_text: str | None = None
+
+
+@dataclass(slots=True)
 class AppContext:
     config: AppConfig
     runner: CodexRunner
@@ -173,6 +181,8 @@ class AppContext:
     model_catalog_checked_at: float = 0.0
     update_progress: BotUpdateProgress | None = None
     update_task: asyncio.Task[None] | None = None
+    whisper_progress: WhisperProgress | None = None
+    whisper_task: asyncio.Task[None] | None = None
 
 
 HELP_TEXT = """
@@ -891,54 +901,56 @@ async def whisper_noop_callback(query: CallbackQuery, app_context: AppContext) -
 async def whisper_install_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
-    if query.message is None:
+    if query.message is None or query.from_user is None:
         await query.answer("Unable to install Whisper.", show_alert=True)
         return
+    if app_context.whisper_task and not app_context.whisper_task.done():
+        await query.answer("Whisper is already being installed.", show_alert=True)
+        return
 
-    await query.answer("Installing Whisper…")
-    async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
-        results = await app_context.queue.submit(
-            f"whisper install by {query.from_user.id if query.from_user else 'unknown'}",
-            app_context.runner.install_whisper,
-        )
-
-    install_ok = all(result.ok for _, result in results)
-    app_context.cached_whisper_state = None
-    app_context.whisper_checked_at = 0.0
-    app_context.cached_environment_status = None
-    app_context.environment_checked_at = 0.0
-    app_context.flash_message = (
-        f"✅ Whisper installed ({app_context.runner.whisper_model_name()})"
-        if install_ok
-        else "❌ Whisper installation failed"
+    app_context.whisper_progress = WhisperProgress(
+        in_progress=True,
+        percent=10,
+        status_text="Installing Whisper runtime",
     )
+    await query.answer("Installing Whisper…")
     await _show_dashboard_from_callback(query, app_context, page="settings")
+    app_context.whisper_task = asyncio.create_task(
+        _perform_whisper_install(
+            app_context,
+            bot=query.bot,
+            chat_id=query.message.chat.id,
+            user_id=query.from_user.id,
+        )
+    )
 
 
 @router.callback_query(F.data == "whisper:delete")
 async def whisper_delete_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
-    if query.message is None:
+    if query.message is None or query.from_user is None:
         await query.answer("Unable to delete Whisper.", show_alert=True)
         return
+    if app_context.whisper_task and not app_context.whisper_task.done():
+        await query.answer("Whisper is already busy.", show_alert=True)
+        return
 
-    await query.answer("Deleting Whisper…")
-    async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
-        results = await app_context.queue.submit(
-            f"whisper delete by {query.from_user.id if query.from_user else 'unknown'}",
-            app_context.runner.uninstall_whisper,
-        )
-
-    uninstall_ok = all(result.ok for _, result in results)
-    app_context.cached_whisper_state = None
-    app_context.whisper_checked_at = 0.0
-    app_context.cached_environment_status = None
-    app_context.environment_checked_at = 0.0
-    app_context.flash_message = (
-        "✅ Whisper removed" if uninstall_ok else "❌ Whisper removal failed"
+    app_context.whisper_progress = WhisperProgress(
+        in_progress=True,
+        percent=10,
+        status_text="Removing Whisper runtime",
     )
+    await query.answer("Deleting Whisper…")
     await _show_dashboard_from_callback(query, app_context, page="settings")
+    app_context.whisper_task = asyncio.create_task(
+        _perform_whisper_delete(
+            app_context,
+            bot=query.bot,
+            chat_id=query.message.chat.id,
+            user_id=query.from_user.id,
+        )
+    )
 
 
 @router.callback_query(F.data == "update:noop")
@@ -1308,6 +1320,24 @@ def _render_update_progress_block(progress: BotUpdateProgress | None) -> str | N
         lines.append("")
         lines.append("<b>Update details</b>")
         lines.extend(f"• {html.escape(note)}" for note in progress.latest_notes[:3])
+    if progress.error_text:
+        lines.append("")
+        lines.append(f"<blockquote>{html.escape(progress.error_text)}</blockquote>")
+    return "\n".join(lines)
+
+
+def _render_whisper_progress_block(progress: WhisperProgress | None) -> str | None:
+    if progress is None:
+        return None
+
+    percent = max(0, min(progress.percent, 100))
+    filled = min(10, max(0, round(percent / 10)))
+    bar = f"[{'#' * filled}{'·' * (10 - filled)}] {percent}%"
+    lines = [
+        "<b>Whisper</b>",
+        f"Status: <code>{html.escape(progress.status_text or 'Idle')}</code>",
+        f"Progress: <code>{bar}</code>",
+    ]
     if progress.error_text:
         lines.append("")
         lines.append(f"<blockquote>{html.escape(progress.error_text)}</blockquote>")
@@ -1734,6 +1764,24 @@ async def _open_fresh_dashboard_from_message(message: Message, app_context: AppC
     )
 
 
+async def send_fresh_dashboard_for_chat(
+    *,
+    bot: Bot,
+    app_context: AppContext,
+    chat_id: int,
+    user_id: int,
+    page: str = "home",
+) -> None:
+    text, markup = await _render_page(app_context, page=page)
+    sent = await bot.send_message(chat_id, text, reply_markup=markup)
+    app_context.dashboards[chat_id] = DashboardSession(
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=sent.message_id,
+        page=page,
+    )
+
+
 async def _show_dashboard_from_callback(query: CallbackQuery, app_context: AppContext, *, page: str) -> None:
     if query.message is None:
         return
@@ -1926,15 +1974,17 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         update_progress = app_context.update_progress
+        whisper_progress = app_context.whisper_progress
         flash_message = app_context.flash_message
         app_context.flash_message = None
-        whisper_busy = bool(app_context.queue.active_label and app_context.queue.active_label.startswith("whisper "))
+        whisper_busy = bool(whisper_progress and whisper_progress.in_progress)
         return (
             build_settings_text(
                 auth_state=auth_state,
                 whisper_state=whisper_state,
                 update_state=update_state,
                 workspaces_root=app_context.config.workspaces_root,
+                whisper_progress_block=_render_whisper_progress_block(whisper_progress),
                 update_progress_block=_render_update_progress_block(update_progress),
                 flash_message=flash_message,
             ),
@@ -2144,19 +2194,46 @@ async def _perform_bot_update(
             page="settings",
         )
 
-        results = await app_context.queue.submit(
-            f"bot update by {user_id}",
-            lambda: app_context.runner.install_self_update(progress.new_commit),
+        script_result, installer_path = await app_context.queue.submit(
+            f"bot update download by {user_id}",
+            lambda: app_context.runner.download_self_update_installer(progress.new_commit),
+        )
+        if not script_result.ok or installer_path is None:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Update failed"
+            progress.error_text = (script_result.stderr or script_result.stdout or "Unable to download the installer.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        progress.percent = 40
+        progress.status_text = "Running the installer"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        install_result = await app_context.queue.submit(
+            f"bot update install by {user_id}",
+            lambda: app_context.runner.run_self_update_installer(installer_path, progress.new_commit),
         )
         app_context.cached_update_state = None
         app_context.update_checked_at = 0.0
 
-        failed_result = next((result for _, result in results if not result.ok), None)
-        if failed_result is not None:
+        if not install_result.ok:
             progress.in_progress = False
             progress.percent = 100
             progress.status_text = "Update failed"
-            progress.error_text = (failed_result.stderr or failed_result.stdout or "Unknown update error.")[:600]
+            progress.error_text = (install_result.stderr or install_result.stdout or "Unknown update error.")[:600]
             await _refresh_dashboard_for_chat(
                 bot=bot,
                 app_context=app_context,
@@ -2205,6 +2282,182 @@ async def _perform_bot_update(
             app_context.update_progress.percent = 100
             app_context.update_progress.status_text = "Update failed"
             app_context.update_progress.error_text = str(exc)
+        with suppress(Exception):
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+
+
+async def _perform_whisper_install(
+    app_context: AppContext,
+    *,
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    progress = app_context.whisper_progress
+    if progress is None:
+        return
+
+    try:
+        runtime_result = await app_context.queue.submit(
+            f"whisper install runtime by {user_id}",
+            app_context.runner.install_whisper_runtime,
+        )
+        if not runtime_result.ok:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Whisper installation failed"
+            progress.error_text = (runtime_result.stderr or runtime_result.stdout or "Whisper runtime installation failed.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        progress.percent = 65
+        progress.status_text = "Downloading the Whisper model"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        model_result = await app_context.queue.submit(
+            f"whisper preload by {user_id}",
+            app_context.runner.preload_whisper_model,
+        )
+        if not model_result.ok:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Whisper installation failed"
+            progress.error_text = (model_result.stderr or model_result.stdout or "Whisper model download failed.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        app_context.cached_whisper_state = None
+        app_context.whisper_checked_at = 0.0
+        app_context.cached_environment_status = None
+        app_context.environment_checked_at = 0.0
+        app_context.whisper_progress = None
+        app_context.flash_message = f"✅ Whisper installed ({app_context.runner.whisper_model_name()})"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+    except Exception as exc:
+        logger.exception("Whisper install failed.")
+        if app_context.whisper_progress is not None:
+            app_context.whisper_progress.in_progress = False
+            app_context.whisper_progress.percent = 100
+            app_context.whisper_progress.status_text = "Whisper installation failed"
+            app_context.whisper_progress.error_text = str(exc)
+        with suppress(Exception):
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+
+
+async def _perform_whisper_delete(
+    app_context: AppContext,
+    *,
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    progress = app_context.whisper_progress
+    if progress is None:
+        return
+
+    try:
+        runtime_result = await app_context.queue.submit(
+            f"whisper uninstall runtime by {user_id}",
+            app_context.runner.uninstall_whisper_runtime,
+        )
+        if not runtime_result.ok:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Whisper removal failed"
+            progress.error_text = (runtime_result.stderr or runtime_result.stdout or "Whisper runtime removal failed.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        progress.percent = 70
+        progress.status_text = "Removing cached Whisper models"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        cleanup_result = await app_context.queue.submit(
+            f"whisper cleanup by {user_id}",
+            app_context.runner.cleanup_whisper_models,
+        )
+        if not cleanup_result.ok:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Whisper removal failed"
+            progress.error_text = (cleanup_result.stderr or cleanup_result.stdout or "Whisper cache cleanup failed.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        app_context.cached_whisper_state = None
+        app_context.whisper_checked_at = 0.0
+        app_context.cached_environment_status = None
+        app_context.environment_checked_at = 0.0
+        app_context.whisper_progress = None
+        app_context.flash_message = "✅ Whisper removed"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+    except Exception as exc:
+        logger.exception("Whisper delete failed.")
+        if app_context.whisper_progress is not None:
+            app_context.whisper_progress.in_progress = False
+            app_context.whisper_progress.percent = 100
+            app_context.whisper_progress.status_text = "Whisper removal failed"
+            app_context.whisper_progress.error_text = str(exc)
         with suppress(Exception):
             await _refresh_dashboard_for_chat(
                 bot=bot,

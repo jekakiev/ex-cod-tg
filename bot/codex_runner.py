@@ -480,32 +480,37 @@ class CodexRunner:
 
         return catalog or self._fallback_model_catalog()
 
-    async def install_whisper(self) -> list[tuple[str, CommandResult]]:
-        install_result = await self._run_process(
+    async def install_whisper_runtime(self) -> CommandResult:
+        return await self._run_process(
             [sys.executable, "-m", "pip", "install", "--upgrade", WHISPER_PIP_PACKAGE],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
-        if not install_result.ok:
-            return [(f"pip install {WHISPER_PIP_PACKAGE}", install_result)]
 
+    async def preload_whisper_model(self) -> CommandResult:
         preload_script = (
             "from faster_whisper import WhisperModel\n"
             f"WhisperModel('{WHISPER_MODEL_NAME}', device='cpu', compute_type='int8')\n"
             "print('ok')\n"
         )
-        preload_result = await self._run_process(
+        return await self._run_process(
             [sys.executable, "-c", preload_script],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
+
+    async def install_whisper(self) -> list[tuple[str, CommandResult]]:
+        install_result = await self.install_whisper_runtime()
+        if not install_result.ok:
+            return [(f"pip install {WHISPER_PIP_PACKAGE}", install_result)]
+        preload_result = await self.preload_whisper_model()
         return [
             (f"pip install {WHISPER_PIP_PACKAGE}", install_result),
             ("download model", preload_result),
         ]
 
-    async def uninstall_whisper(self) -> list[tuple[str, CommandResult]]:
-        uninstall_result = await self._run_process(
+    async def uninstall_whisper_runtime(self) -> CommandResult:
+        return await self._run_process(
             [
                 sys.executable,
                 "-m",
@@ -524,6 +529,8 @@ class CodexRunner:
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=600,
         )
+
+    async def cleanup_whisper_models(self) -> CommandResult:
         cleanup_script = (
             "from pathlib import Path\n"
             "import shutil\n"
@@ -536,22 +543,26 @@ class CodexRunner:
             "        removed.append(path.name)\n"
             "print('\\n'.join(removed))\n"
         )
-        cleanup_result = await self._run_process(
+        return await self._run_process(
             [sys.executable, "-c", cleanup_script],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=120,
         )
+
+    async def uninstall_whisper(self) -> list[tuple[str, CommandResult]]:
+        uninstall_result = await self.uninstall_whisper_runtime()
+        cleanup_result = await self.cleanup_whisper_models()
         return [
             ("pip uninstall whisper runtime", uninstall_result),
             ("remove cached whisper models", cleanup_result),
         ]
 
-    async def install_self_update(self, ref: str | None = None) -> list[tuple[str, CommandResult]]:
+    async def download_self_update_installer(self, ref: str | None = None) -> tuple[CommandResult, Path | None]:
         target_ref = (ref or "main").strip() or "main"
-        script_result, installer_path = await asyncio.to_thread(self._download_update_installer, target_ref)
-        if not script_result.ok or installer_path is None:
-            return [(f"download install.sh ({target_ref})", script_result)]
+        return await asyncio.to_thread(self._download_update_installer, target_ref)
 
+    async def run_self_update_installer(self, installer_path: Path, ref: str | None = None) -> CommandResult:
+        target_ref = (ref or "main").strip() or "main"
         repo_url = f"{SELF_REPO_GIT_BASE}@{target_ref}"
         install_result = await self._run_process(
             [
@@ -564,10 +575,16 @@ class CodexRunner:
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
-
         with suppress(OSError):
             installer_path.unlink()
+        return install_result
 
+    async def install_self_update(self, ref: str | None = None) -> list[tuple[str, CommandResult]]:
+        target_ref = (ref or "main").strip() or "main"
+        script_result, installer_path = await self.download_self_update_installer(target_ref)
+        if not script_result.ok or installer_path is None:
+            return [(f"download install.sh ({target_ref})", script_result)]
+        install_result = await self.run_self_update_installer(installer_path, target_ref)
         return [
             (f"download install.sh ({target_ref})", script_result),
             ("run install.sh", install_result),

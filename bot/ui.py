@@ -200,6 +200,7 @@ def build_settings_text(
     whisper_state: WhisperState,
     update_state: BotUpdateState,
     workspaces_root: Path,
+    whisper_progress_block: str | None,
     update_progress_block: str | None,
     flash_message: str | None = None,
 ) -> str:
@@ -211,6 +212,8 @@ def build_settings_text(
         f"Whisper: <code>{html.escape(whisper_state.summary)}</code>\n"
         f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>"
     )
+    if whisper_progress_block:
+        text = f"{text}\n\n{whisper_progress_block}"
     if update_progress_block:
         text = f"{text}\n\n{update_progress_block}"
     if flash_message:
