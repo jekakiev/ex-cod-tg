@@ -46,6 +46,8 @@ class AppConfig:
     shell_timeout_seconds: int
     git_timeout_seconds: int
     max_output_chars: int
+    telegram_max_images_per_request: int
+    telegram_image_max_bytes: int
     config_file: Path = field(repr=False)
     project_root: Path = field(repr=False)
 
@@ -73,6 +75,8 @@ class AppConfig:
             "SHELL_TIMEOUT_SECONDS",
             "GIT_TIMEOUT_SECONDS",
             "MAX_OUTPUT_CHARS",
+            "TELEGRAM_MAX_IMAGES_PER_REQUEST",
+            "TELEGRAM_IMAGE_MAX_BYTES",
         ):
             env_value = os.getenv(key)
             if env_value is not None and env_value.strip():
@@ -136,6 +140,16 @@ class AppConfig:
                 merged_values,
                 "MAX_OUTPUT_CHARS",
                 20000,
+            ),
+            telegram_max_images_per_request=_parse_positive_int_from_values(
+                merged_values,
+                "TELEGRAM_MAX_IMAGES_PER_REQUEST",
+                10,
+            ),
+            telegram_image_max_bytes=_parse_positive_int_from_values(
+                merged_values,
+                "TELEGRAM_IMAGE_MAX_BYTES",
+                20 * 1024 * 1024,
             ),
             config_file=config_file,
             project_root=project_root,

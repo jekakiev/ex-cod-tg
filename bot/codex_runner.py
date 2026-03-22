@@ -125,18 +125,19 @@ class CodexStreamAccumulator:
     assistant_text: str = ""
     reasoning_text: str = ""
 
-    def apply_raw_line(self, raw_line: str) -> str | None:
-        event = _parse_codex_stream_event(raw_line)
-        if event is None:
-            return None
-
+    def apply_event(self, event: CodexStreamEvent) -> str:
         attribute = "reasoning_text" if event.kind == "reasoning" else "assistant_text"
         current = getattr(self, attribute)
         updated = _merge_stream_text(current, event.text, is_delta=event.is_delta)
         if updated != current:
             setattr(self, attribute, updated)
-
         return self.preview_text
+
+    def apply_raw_line(self, raw_line: str) -> str | None:
+        event = _parse_codex_stream_event(raw_line)
+        if event is None:
+            return None
+        return self.apply_event(event)
 
     @property
     def preview_text(self) -> str:
@@ -793,9 +794,11 @@ class CodexRunner:
         self,
         prompt: str,
         *,
+        image_paths: list[Path] | tuple[Path, ...] | None = None,
         on_update: Callable[[str], Awaitable[None]] | None = None,
     ) -> CodexStreamResult:
         prompt = prompt.strip()
+        normalized_image_paths = [Path(path) for path in (image_paths or [])]
         if not prompt:
             result = self._synthetic_error_result(
                 [self.config.codex_bin, "exec"],
@@ -823,6 +826,15 @@ class CodexRunner:
             )
             return CodexStreamResult(result=result, final_text="")
 
+        missing_image = next((path for path in normalized_image_paths if not path.exists() or not path.is_file()), None)
+        if missing_image is not None:
+            result = self._synthetic_error_result(
+                [self.config.codex_bin, "exec", "-i", str(missing_image), prompt],
+                f"Image file does not exist: {missing_image}",
+                exit_code=2,
+            )
+            return CodexStreamResult(result=result, final_text="")
+
         output_file = Path(tempfile.gettempdir()) / f"ex-cod-tg-codex-last-{int(time.time() * 1000)}.txt"
         args = [
             self.config.codex_bin,
@@ -840,8 +852,10 @@ class CodexRunner:
             str(self.config.working_dir),
             "-o",
             str(output_file),
-            prompt,
         ]
+        for image_path in normalized_image_paths:
+            args.extend(["-i", str(image_path)])
+        args.append(prompt)
         command_display = shlex.join(args)
         started_at = time.perf_counter()
         self._logger.info("Running streaming Codex command in %s: %s", self.config.working_dir, command_display)
@@ -876,10 +890,10 @@ class CodexRunner:
             payload = payload.strip()
             if not payload:
                 return
-            now = time.monotonic()
-            if not force and payload == last_payload and now - last_emit_at < 1.5:
+            if payload == last_payload:
                 return
-            if not force and now - last_emit_at < 0.25:
+            now = time.monotonic()
+            if not force and now - last_emit_at < 0.08:
                 return
             await on_update(payload)
             last_emit_at = now
@@ -901,7 +915,7 @@ class CodexRunner:
             if process.stdout is not None:
                 while True:
                     chunk = await asyncio.wait_for(
-                        process.stdout.read(512),
+                        process.stdout.read(128),
                         timeout=self.config.command_timeout_seconds,
                     )
                     if not chunk:
@@ -919,9 +933,12 @@ class CodexRunner:
                         stdout_buffer = lines[-1] if lines else stdout_buffer
 
                     for raw_line in complete_lines:
-                        preview = stream_state.apply_raw_line(raw_line)
+                        event = _parse_codex_stream_event(raw_line)
+                        if event is None:
+                            continue
+                        preview = stream_state.apply_event(event)
                         if preview:
-                            await emit(preview)
+                            await emit(preview, force=event.kind == "assistant")
 
                     partial_preview = stream_state.preview_text_with_partial(stdout_buffer)
                     if partial_preview:
@@ -1306,6 +1323,7 @@ def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
 
     event_type = str(payload.get("type", "")).lower()
     normalized_event_type = event_type.replace(".", "_")
+    inferred_kind = _infer_stream_kind(payload)
     candidate_values: list[Any] = []
 
     if "delta" in payload:
@@ -1331,7 +1349,7 @@ def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
     if "output" in payload:
         candidate_values.append(payload["output"])
 
-    if not any(
+    if inferred_kind is None and not any(
         marker in normalized_event_type
         for marker in (
             "delta",
@@ -1342,6 +1360,7 @@ def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
             "reasoning",
             "summary",
             "thinking",
+            "completed",
         )
     ):
         return None
@@ -1354,7 +1373,10 @@ def _parse_codex_stream_event(raw_line: str) -> CodexStreamEvent | None:
     if _is_low_value_stream_text(joined):
         return None
 
-    kind = "reasoning" if any(marker in normalized_event_type for marker in ("reasoning", "summary", "thinking")) else "assistant"
+    if inferred_kind is not None:
+        kind = inferred_kind
+    else:
+        kind = "reasoning" if any(marker in normalized_event_type for marker in ("reasoning", "summary", "thinking")) else "assistant"
     return CodexStreamEvent(
         kind=kind,
         text=joined,
@@ -1462,6 +1484,36 @@ def _collect_text_fragments(value: Any, fragments: list[str]) -> None:
             continue
         if isinstance(item, (dict, list)):
             _collect_text_fragments(item, fragments)
+
+
+def _infer_stream_kind(value: Any) -> str | None:
+    if isinstance(value, dict):
+        type_value = str(value.get("type", "")).lower().replace(".", "_")
+        if any(marker in type_value for marker in ("reasoning", "summary", "thinking")):
+            return "reasoning"
+        if any(marker in type_value for marker in ("agent_message", "message", "output_text")):
+            return "assistant"
+
+        for key in ("item", "data", "response", "output", "content", "message", "part"):
+            if key in value:
+                inferred = _infer_stream_kind(value[key])
+                if inferred is not None:
+                    return inferred
+
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                inferred = _infer_stream_kind(item)
+                if inferred is not None:
+                    return inferred
+        return None
+
+    if isinstance(value, list):
+        for item in value:
+            inferred = _infer_stream_kind(item)
+            if inferred is not None:
+                return inferred
+
+    return None
 
 
 def _merge_stream_text(current: str, incoming: str, *, is_delta: bool) -> str:

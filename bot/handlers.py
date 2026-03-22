@@ -134,6 +134,20 @@ class PendingVoiceRequest:
 
 
 @dataclass(slots=True)
+class PendingImageAttachment:
+    temp_path: Path
+    original_name: str
+    size_bytes: int
+
+
+@dataclass(slots=True)
+class PendingImageRequest:
+    owner_user_id: int
+    owner_chat_id: int
+    attachments: list[PendingImageAttachment] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class BotUpdateProgress:
     awaiting_confirmation: bool = False
     in_progress: bool = False
@@ -166,6 +180,7 @@ class AppContext:
     pending_admin_request: PendingAdminRequest | None = None
     pending_workspaces_root_request: PendingWorkspacesRootRequest | None = None
     pending_voice_requests: dict[str, PendingVoiceRequest] = field(default_factory=dict)
+    pending_image_requests: dict[int, PendingImageRequest] = field(default_factory=dict)
     codex_login_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     codex_login_session: CodexLoginSession | None = None
     flash_message: str | None = None
@@ -190,6 +205,7 @@ HELP_TEXT = """
 <code>/start</code> Open a fresh main menu message
 <code>/help</code> Show this help message
 <code>&lt;plain message&gt;</code> Chat with Codex in the active repository
+<code>&lt;photo/image file&gt;</code> Send with a caption, or send text next to use it as input for Codex
 <code>&lt;voice message&gt;</code> Transcribe locally with Whisper, then approve before running Codex
 <code>/ask &lt;text&gt;</code> Send a prompt to the local Codex CLI
 <code>/fix &lt;task&gt;</code> Ask Codex to make a focused code fix
@@ -1090,6 +1106,10 @@ async def generic_message_handler(message: Message, app_context: AppContext) -> 
         await _handle_voice_message(message, app_context)
         return
 
+    if message.photo or message.document is not None:
+        if await _handle_image_message(message, app_context):
+            return
+
     text = (message.text or "").strip()
     if not text:
         return
@@ -1099,7 +1119,16 @@ async def generic_message_handler(message: Message, app_context: AppContext) -> 
         return
 
     _clear_pending_voice_requests_for_user(app_context, user_id)
-    await _run_codex_chat(message, app_context, text)
+    pending_images = _take_pending_images_for_chat(app_context, message.chat.id)
+    try:
+        await _run_codex_chat(
+            message,
+            app_context,
+            text,
+            image_paths=[attachment.temp_path for attachment in pending_images],
+        )
+    finally:
+        _cleanup_image_attachments(pending_images)
 
 
 async def _bootstrap_first_admin_if_needed(app_context: AppContext, user_id: int, label: str) -> bool:
@@ -1556,8 +1585,20 @@ async def voice_cancel_callback(query: CallbackQuery, app_context: AppContext) -
     await query.answer("Cancelled.")
 
 
-async def _run_codex_chat(message: Message, app_context: AppContext, prompt: str) -> None:
-    await _run_codex_chat_request(message, app_context, prompt, user_id=message.from_user.id if message.from_user else None)
+async def _run_codex_chat(
+    message: Message,
+    app_context: AppContext,
+    prompt: str,
+    *,
+    image_paths: list[Path] | None = None,
+) -> None:
+    await _run_codex_chat_request(
+        message,
+        app_context,
+        prompt,
+        user_id=message.from_user.id if message.from_user else None,
+        image_paths=image_paths,
+    )
 
 
 async def _run_codex_chat_request(
@@ -1566,8 +1607,16 @@ async def _run_codex_chat_request(
     prompt: str,
     *,
     user_id: int | None,
+    image_paths: list[Path] | None = None,
 ) -> None:
-    logger.info("Telegram chat prompt from %s in %s: %s", user_id, app_context.config.working_dir, prompt[:500])
+    image_count = len(image_paths or [])
+    logger.info(
+        "Telegram chat prompt from %s in %s with %s image(s): %s",
+        user_id,
+        app_context.config.working_dir,
+        image_count,
+        prompt[:500],
+    )
 
     jobs_ahead = app_context.queue.jobs_ahead()
     if jobs_ahead > 0:
@@ -1594,6 +1643,7 @@ async def _run_codex_chat_request(
                 reply=reply,
                 prompt=prompt,
                 app_context=app_context,
+                image_paths=image_paths or [],
             ),
         )
 
@@ -1714,6 +1764,7 @@ async def _execute_codex_chat_stream(
     reply: Message,
     prompt: str,
     app_context: AppContext,
+    image_paths: list[Path],
 ) -> Any:
     last_edit_at = 0.0
     last_rendered_text = ""
@@ -1759,9 +1810,9 @@ async def _execute_codex_chat_stream(
         if not text:
             return
         preview_seen = True
-        if text == last_rendered_text and now - last_edit_at < 1.5:
+        if text == last_rendered_text:
             return
-        if now - last_edit_at < 0.25:
+        if now - last_edit_at < 0.08:
             return
         await _edit_streaming_message(
             reply,
@@ -1779,12 +1830,175 @@ async def _execute_codex_chat_stream(
 
     spinner_task = asyncio.create_task(spinner())
     try:
-        return await app_context.runner.run_codex_streaming_prompt(prompt, on_update=on_update)
+        return await app_context.runner.run_codex_streaming_prompt(
+            prompt,
+            image_paths=image_paths,
+            on_update=on_update,
+        )
     finally:
         spinner_stop.set()
         spinner_task.cancel()
         with suppress(asyncio.CancelledError):
             await spinner_task
+
+
+async def _handle_image_message(message: Message, app_context: AppContext) -> bool:
+    if message.from_user is None:
+        return False
+
+    supported = message.photo or _is_supported_image_document(message)
+    if not supported:
+        if message.document is not None:
+            await message.reply("Please send a photo or an image file.")
+            return True
+        return False
+
+    try:
+        attachments = await _download_image_attachments(message, app_context)
+    except ValueError as exc:
+        await message.reply(html.escape(str(exc)))
+        return True
+    except OSError:
+        logger.exception("Failed to download Telegram image attachment")
+        await message.reply("Failed to download the image. Please try again.")
+        return True
+
+    caption = (message.caption or "").strip()
+    if caption:
+        pending_attachments = _take_pending_images_for_chat(app_context, message.chat.id)
+        all_attachments = [*pending_attachments, *attachments]
+        max_images = app_context.config.telegram_max_images_per_request
+        if len(all_attachments) > max_images:
+            _cleanup_image_attachments(attachments)
+            app_context.pending_image_requests[message.chat.id] = PendingImageRequest(
+                owner_user_id=message.from_user.id,
+                owner_chat_id=message.chat.id,
+                attachments=pending_attachments,
+            )
+            await message.reply(f"Too many images. Limit is {max_images} per request.")
+            return True
+
+        try:
+            await _run_codex_chat(
+                message,
+                app_context,
+                caption,
+                image_paths=[attachment.temp_path for attachment in all_attachments],
+            )
+        finally:
+            _cleanup_image_attachments(all_attachments)
+        return True
+
+    pending_request = app_context.pending_image_requests.get(message.chat.id)
+    if pending_request is None:
+        pending_request = PendingImageRequest(
+            owner_user_id=message.from_user.id,
+            owner_chat_id=message.chat.id,
+        )
+        app_context.pending_image_requests[message.chat.id] = pending_request
+
+    pending_request.owner_user_id = message.from_user.id
+    pending_request.attachments.extend(attachments)
+
+    max_images = app_context.config.telegram_max_images_per_request
+    if len(pending_request.attachments) > max_images:
+        overflow = pending_request.attachments[max_images:]
+        pending_request.attachments = pending_request.attachments[:max_images]
+        _cleanup_image_attachments(overflow)
+        await message.reply(f"Image limit reached. Kept the first {max_images} images for the next Codex task.")
+        return True
+
+    count = len(pending_request.attachments)
+    noun = "image" if count == 1 else "images"
+    await message.reply(f"{count} {noun} received. Now send a task for Codex.")
+    return True
+
+
+async def _download_image_attachments(message: Message, app_context: AppContext) -> list[PendingImageAttachment]:
+    candidates: list[tuple[str, str | None, int | None]] = []
+    if message.photo:
+        best_photo = message.photo[-1]
+        candidates.append((best_photo.file_id, None, best_photo.file_size))
+    elif message.document is not None:
+        candidates.append((message.document.file_id, message.document.file_name, message.document.file_size))
+    else:
+        return []
+
+    attachments: list[PendingImageAttachment] = []
+    max_bytes = app_context.config.telegram_image_max_bytes
+    try:
+        for file_id, original_name, file_size in candidates:
+            if file_size is not None and file_size > max_bytes:
+                raise ValueError(f"Image is too large. Limit is {_format_bytes(max_bytes)}.")
+
+            file_info = await message.bot.get_file(file_id)
+            source_name = original_name or Path(file_info.file_path or "image").name or "image"
+            suffix = Path(source_name).suffix or ".jpg"
+            temp_file = tempfile.NamedTemporaryFile(prefix="ex-cod-tg-image-", suffix=suffix, delete=False)
+            temp_path = Path(temp_file.name)
+            temp_file.close()
+
+            try:
+                with temp_path.open("wb") as handle:
+                    await message.bot.download_file(file_info.file_path, destination=handle)
+            except Exception:
+                with suppress(OSError):
+                    temp_path.unlink()
+                raise
+
+            size_bytes = temp_path.stat().st_size
+            if size_bytes > max_bytes:
+                with suppress(OSError):
+                    temp_path.unlink()
+                raise ValueError(f"Image is too large. Limit is {_format_bytes(max_bytes)}.")
+
+            attachments.append(
+                PendingImageAttachment(
+                    temp_path=temp_path,
+                    original_name=source_name,
+                    size_bytes=size_bytes,
+                )
+            )
+        return attachments
+    except Exception:
+        _cleanup_image_attachments(attachments)
+        raise
+
+
+def _is_supported_image_document(message: Message) -> bool:
+    document = message.document
+    if document is None:
+        return False
+    mime_type = (document.mime_type or "").lower()
+    if mime_type.startswith("image/"):
+        return True
+    suffix = Path(document.file_name or "").suffix.lower()
+    return suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic"}
+
+
+def _take_pending_images_for_chat(app_context: AppContext, chat_id: int) -> list[PendingImageAttachment]:
+    pending = app_context.pending_image_requests.pop(chat_id, None)
+    if pending is None:
+        return []
+    return pending.attachments
+
+
+def _cleanup_image_attachments(attachments: list[PendingImageAttachment]) -> None:
+    for attachment in attachments:
+        with suppress(OSError):
+            attachment.temp_path.unlink()
+
+
+def _format_bytes(size_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    size = float(size_bytes)
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024
+    precision = 0 if unit == "B" else 1
+    return f"{size:.{precision}f} {unit}"
 
 
 async def _show_dashboard_from_message(message: Message, app_context: AppContext, *, page: str) -> None:

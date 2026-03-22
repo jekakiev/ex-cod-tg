@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6
+
+- Telegram image input is now supported: send a captioned photo to run Codex immediately, or send images first and text next to use them in one request.
+- Image requests are limited and cleaned up safely, with configurable size and count limits for Telegram uploads.
+- Live reply streaming is now more reliable for long `codex exec --json` runs because completed nested `item` events are parsed correctly instead of leaving the chat stuck on `Preparing reply ...`.
+
 ## 0.1.5
 
 - Live Codex streaming now ignores internal reasoning text in Telegram and starts showing only user-facing reply content as soon as partial assistant text appears.

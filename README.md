@@ -20,6 +20,7 @@ Built for a simple workflow:
 - model and thinking-level switching for Codex tasks
 - selected-model presets for quick switching
 - plain chat messages sent directly to Codex with streaming output
+- photos and image files passed to Codex with caption-now or text-next UX
 - optional local Whisper transcription for Telegram voice messages
 - in-app bot update button with release notes after restart
 - macOS menu bar helper with bot status, start/stop controls, logs, and launch-at-login toggle
@@ -82,6 +83,12 @@ On macOS, the install also adds a menu bar helper so you can see bot status, ope
 
 Plain text messages also work: just send a task in chat and Codex will start.
 
+Photos and image files also work:
+
+- send an image with a caption to run Codex immediately
+- send an image without a caption and the bot keeps it pending for the next text message
+- up to `TELEGRAM_MAX_IMAGES_PER_REQUEST` images are kept per request, with temp files cleaned up after execution
+
 Model and thinking level are switched directly from the Telegram buttons on the dashboard and under each Codex reply.
 
 Voice messages also work when Whisper is installed: the bot transcribes them locally, shows the text for confirmation, and only runs Codex after approval.
@@ -116,6 +123,8 @@ COMMAND_TIMEOUT_SECONDS=900
 SHELL_TIMEOUT_SECONDS=120
 GIT_TIMEOUT_SECONDS=120
 MAX_OUTPUT_CHARS=20000
+TELEGRAM_MAX_IMAGES_PER_REQUEST=10
+TELEGRAM_IMAGE_MAX_BYTES=20971520
 ```
 
 ## Security Notes
