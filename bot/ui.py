@@ -239,6 +239,14 @@ def settings_keyboard(
             ]
         )
 
+    if update_busy:
+        return _keyboard(
+            [
+                [InlineKeyboardButton(text="⏳ Updating bot…", callback_data="update:noop")],
+                [InlineKeyboardButton(text="⬅️ Back", callback_data="update:blocked")],
+            ]
+        )
+
     rows = [
         [
             InlineKeyboardButton(text="Admins", callback_data="nav:admins"),
@@ -264,20 +272,12 @@ def settings_keyboard(
             ),
         ],
     ]
-    if update_busy:
-        rows.append(
-            [
-                InlineKeyboardButton(text="⏳ Updating bot…", callback_data="update:noop"),
-                InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
-            ]
-        )
-    else:
-        rows.append(
-            [
-                InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run"),
-                InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
-            ]
-        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run"),
+            InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
+        ]
+    )
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")])
     return _keyboard(rows)
 

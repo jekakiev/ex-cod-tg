@@ -430,6 +430,10 @@ async def navigation_callback(query: CallbackQuery, app_context: AppContext) -> 
     if not await _ensure_authorized_callback(query, app_context):
         return
 
+    if app_context.update_progress and app_context.update_progress.in_progress:
+        await query.answer("Wait until the bot update finishes.", show_alert=True)
+        return
+
     page = query.data.split(":", 1)[1]
     if page in {"model", "models", "thinking"}:
         page = "home"
@@ -958,6 +962,13 @@ async def update_noop_callback(query: CallbackQuery, app_context: AppContext) ->
     if not await _ensure_authorized_callback(query, app_context):
         return
     await query.answer()
+
+
+@router.callback_query(F.data == "update:blocked")
+async def update_blocked_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    await query.answer("Wait until the bot update finishes.", show_alert=True)
 
 
 @router.callback_query(F.data == "update:run")
@@ -2350,6 +2361,16 @@ async def _perform_whisper_install(
             )
             return
 
+        progress.percent = 90
+        progress.status_text = "Finalizing Whisper setup"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
         app_context.cached_whisper_state = None
         app_context.whisper_checked_at = 0.0
         app_context.cached_environment_status = None
@@ -2437,6 +2458,16 @@ async def _perform_whisper_delete(
                 page="settings",
             )
             return
+
+        progress.percent = 90
+        progress.status_text = "Finalizing Whisper removal"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
 
         app_context.cached_whisper_state = None
         app_context.whisper_checked_at = 0.0

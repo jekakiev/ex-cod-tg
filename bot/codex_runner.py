@@ -351,33 +351,24 @@ class CodexRunner:
         )
 
     async def collect_whisper_state(self) -> WhisperState:
-        probe = await self._run_process(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import importlib.metadata as metadata; "
-                    f"print(metadata.version('{WHISPER_PIP_PACKAGE}'))"
-                ),
-            ],
-            cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
-            timeout=30,
-            log_command=False,
-        )
-        if not probe.ok:
+        runtime_executable, version, runtime_label = await self._resolve_whisper_runtime()
+        if runtime_executable is None:
             return WhisperState(
                 installed=False,
                 model_name=self.whisper_model_name(),
                 summary="Not installed",
-                details=(probe.stderr or probe.stdout).strip() or None,
+                details="Whisper was not found in the bot environment or in system python3.",
             )
 
-        version = probe.stdout.strip() or None
+        details = None
+        if runtime_executable != sys.executable:
+            details = f"Using external runtime: {runtime_label or runtime_executable}"
         return WhisperState(
             installed=True,
             model_name=self.whisper_model_name(),
             summary=f"Installed ({self.whisper_model_name()})",
             package_version=version,
+            details=details,
         )
 
     async def collect_environment_status(
@@ -487,14 +478,15 @@ class CodexRunner:
             timeout=1800,
         )
 
-    async def preload_whisper_model(self) -> CommandResult:
+    async def preload_whisper_model(self, executable: str | None = None) -> CommandResult:
+        runtime_executable = executable or sys.executable
         preload_script = (
             "from faster_whisper import WhisperModel\n"
             f"WhisperModel('{WHISPER_MODEL_NAME}', device='cpu', compute_type='int8')\n"
             "print('ok')\n"
         )
         return await self._run_process(
-            [sys.executable, "-c", preload_script],
+            [runtime_executable, "-c", preload_script],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
@@ -510,9 +502,11 @@ class CodexRunner:
         ]
 
     async def uninstall_whisper_runtime(self) -> CommandResult:
+        runtime_executable, _, _ = await self._resolve_whisper_runtime()
+        executable = runtime_executable or sys.executable
         return await self._run_process(
             [
-                sys.executable,
+                executable,
                 "-m",
                 "pip",
                 "uninstall",
@@ -650,11 +644,11 @@ class CodexRunner:
             )
             return VoiceTranscriptionResult(result=result, text="")
 
-        whisper_state = await self.collect_whisper_state()
-        if not whisper_state.installed:
+        runtime_executable, _, _ = await self._resolve_whisper_runtime()
+        if runtime_executable is None:
             result = self._synthetic_error_result(
                 [sys.executable, "-c", "transcribe"],
-                "Whisper is not installed. Open Settings -> Whisper and install it first.",
+                "Whisper is not installed. Open Settings and install it first.",
                 exit_code=127,
             )
             return VoiceTranscriptionResult(result=result, text="")
@@ -671,7 +665,7 @@ class CodexRunner:
             "print(json.dumps(payload, ensure_ascii=False))\n"
         )
         result = await self._run_process(
-            [sys.executable, "-c", transcription_script, str(audio_path)],
+            [runtime_executable, "-c", transcription_script, str(audio_path)],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=900,
         )
@@ -688,6 +682,35 @@ class CodexRunner:
             text=str(payload.get("text") or "").strip(),
             language=str(payload["language"]) if payload.get("language") else None,
         )
+
+    async def _resolve_whisper_runtime(self) -> tuple[str | None, str | None, str | None]:
+        candidates: list[tuple[str, str]] = [(sys.executable, "bot environment")]
+        system_python = shutil.which("python3")
+        if system_python and Path(system_python).resolve(strict=False) != Path(sys.executable).resolve(strict=False):
+            candidates.append((system_python, "system python3"))
+
+        seen: set[str] = set()
+        for executable, label in candidates:
+            if executable in seen:
+                continue
+            seen.add(executable)
+            probe = await self._run_process(
+                [
+                    executable,
+                    "-c",
+                    (
+                        "import importlib.metadata as metadata; "
+                        f"print(metadata.version('{WHISPER_PIP_PACKAGE}'))"
+                    ),
+                ],
+                cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+                timeout=30,
+                log_command=False,
+            )
+            if probe.ok:
+                return executable, probe.stdout.strip() or None, label
+
+        return None, None, None
 
     async def run_codex_prompt(self, prompt: str) -> CommandResult:
         prompt = prompt.strip()
