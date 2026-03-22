@@ -33,7 +33,7 @@ def main() -> int:
             NSStatusBar,
             NSVariableStatusItemLength,
         )
-        from Foundation import NSTimer  # type: ignore
+        from Foundation import NSMakeSize, NSTimer  # type: ignore
     except Exception as exc:  # pragma: no cover - import/runtime guard
         raise SystemExit(f"Tray helper requires PyObjC on macOS: {exc}") from exc
 
@@ -70,6 +70,7 @@ def main() -> int:
                 image = NSImage.alloc().initWithContentsOfFile_(str(self.icon_path))
                 if image is not None:
                     image.setTemplate_(True)
+                    image.setSize_(NSMakeSize(18, 18))
                     button.setImage_(image)
             else:
                 button.setTitle_("ex")
