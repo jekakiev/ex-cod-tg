@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_URL="${EX_COD_TG_REPO_URL:-git+https://github.com/jekakiev/ex-cod-tg.git@main}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 BIN_DIR="${EX_COD_TG_BIN_DIR:-$HOME/.local/bin}"
+SKIP_SERVICE_INSTALL="${EX_COD_TG_SKIP_SERVICE_INSTALL:-0}"
 
 detect_platform() {
   case "$(uname -s)" in
@@ -58,11 +59,15 @@ echo "Installing ex-cod-tg..."
 
 ln -sf "$EX_COD_BIN" "$SHIM_PATH"
 
-echo "Starting service installation..."
-if [[ -r /dev/tty ]]; then
-  "$EX_COD_BIN" service install </dev/tty
+if [[ "$SKIP_SERVICE_INSTALL" == "1" ]]; then
+  echo "Skipping service installation."
 else
-  "$EX_COD_BIN" service install
+  echo "Starting service installation..."
+  if [[ -r /dev/tty ]]; then
+    "$EX_COD_BIN" service install </dev/tty
+  else
+    "$EX_COD_BIN" service install
+  fi
 fi
 
 cat <<EOF

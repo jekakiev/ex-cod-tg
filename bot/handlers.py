@@ -52,7 +52,6 @@ from bot.ui import (
     build_admins_text,
     build_codex_text,
     build_home_text,
-    build_model_text,
     build_selected_models_text,
     build_settings_text,
     build_voice_preview_text,
@@ -61,7 +60,6 @@ from bot.ui import (
     codex_keyboard,
     home_keyboard,
     model_label,
-    model_keyboard,
     response_controls_keyboard,
     selected_models_keyboard,
     settings_keyboard,
@@ -138,6 +136,20 @@ class PendingVoiceRequest:
 
 
 @dataclass(slots=True)
+class BotUpdateProgress:
+    awaiting_confirmation: bool = False
+    in_progress: bool = False
+    percent: int = 0
+    status_text: str = ""
+    target_version: str | None = None
+    latest_summary: str | None = None
+    latest_notes: list[str] = field(default_factory=list)
+    old_commit: str | None = None
+    new_commit: str | None = None
+    error_text: str | None = None
+
+
+@dataclass(slots=True)
 class AppContext:
     config: AppConfig
     runner: CodexRunner
@@ -161,6 +173,8 @@ class AppContext:
     whisper_checked_at: float = 0.0
     cached_model_catalog: list[CodexModelInfo] | None = None
     model_catalog_checked_at: float = 0.0
+    update_progress: BotUpdateProgress | None = None
+    update_task: asyncio.Task[None] | None = None
 
 
 HELP_TEXT = """
@@ -216,28 +230,6 @@ async def help_command(message: Message, app_context: AppContext) -> None:
     if not await _ensure_authorized_message(message, app_context):
         return
     await message.answer(HELP_TEXT)
-
-
-@router.message(Command("status"))
-async def status_command(message: Message, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-    await _show_dashboard_from_message(message, app_context, page="home")
-
-
-@router.message(Command("admins"))
-async def admins_command(message: Message, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-    await _sync_admin_label_from_message(message, app_context)
-    await _show_dashboard_from_message(message, app_context, page="admins")
-
-
-@router.message(Command("model"))
-async def model_command(message: Message, app_context: AppContext) -> None:
-    if not await _ensure_authorized_message(message, app_context):
-        return
-    await _show_dashboard_from_message(message, app_context, page="model")
 
 
 @router.message(Command("ask"))
@@ -431,8 +423,10 @@ async def navigation_callback(query: CallbackQuery, app_context: AppContext) -> 
         return
 
     page = query.data.split(":", 1)[1]
-    await _show_dashboard_from_callback(query, app_context, page=page)
+    if page in {"model", "models", "thinking"}:
+        page = "home"
     await query.answer()
+    await _show_dashboard_from_callback(query, app_context, page=page)
 
 
 @router.callback_query(F.data == "repo:noop")
@@ -442,43 +436,30 @@ async def repo_noop_callback(query: CallbackQuery, app_context: AppContext) -> N
     await query.answer()
 
 
-@router.callback_query(F.data.in_({"codexmodel:noop", "thinking:noop"}))
-async def model_noop_callback(query: CallbackQuery, app_context: AppContext) -> None:
-    if not await _ensure_authorized_callback(query, app_context):
-        return
-    await query.answer()
-
-
 @router.callback_query(F.data == "repo:list")
 async def repo_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
-    await _show_dashboard_from_callback(query, app_context, page="repos")
     await query.answer()
+    await _show_dashboard_from_callback(query, app_context, page="repos")
 
 
 @router.callback_query(F.data == "branch:list")
 async def branch_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
-    await _show_dashboard_from_callback(query, app_context, page="branches")
     await query.answer()
+    await _show_dashboard_from_callback(query, app_context, page="branches")
 
 
 @router.callback_query(F.data == "codexmodel:list")
-async def codexmodel_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
-    if not await _ensure_authorized_callback(query, app_context):
-        return
-    await _show_dashboard_from_callback(query, app_context, page="models")
-    await query.answer()
+async def legacy_codexmodel_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    await quick_model_callback(query, app_context)
 
 
 @router.callback_query(F.data == "thinking:list")
-async def thinking_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
-    if not await _ensure_authorized_callback(query, app_context):
-        return
-    await _show_dashboard_from_callback(query, app_context, page="thinking")
-    await query.answer()
+async def legacy_thinking_list_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    await quick_thinking_callback(query, app_context)
 
 
 @router.callback_query(F.data.in_({"repo:prev", "repo:next"}))
@@ -549,11 +530,15 @@ async def branch_cycle_callback(query: CallbackQuery, app_context: AppContext) -
 
 
 @router.callback_query(F.data.in_({"codexmodel:prev", "codexmodel:next"}))
-async def codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
+async def legacy_codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
 
     models = _effective_selected_models(app_context)
+    if len(models) < 2:
+        await query.answer()
+        return
+
     current_index = models.index(app_context.config.codex_model) if app_context.config.codex_model in models else 0
     direction = -1 if query.data == "codexmodel:prev" else 1
     next_model = models[(current_index + direction) % len(models)]
@@ -562,22 +547,26 @@ async def codexmodel_cycle_callback(query: CallbackQuery, app_context: AppContex
         codex_model=next_model,
         thinking_level=_effective_thinking_level(app_context, next_model),
     )
-    await _show_dashboard_from_callback(query, app_context, page="model")
+    await _refresh_quick_controls_target(query, app_context)
     await query.answer(f"Model: {model_label(next_model)}")
 
 
 @router.callback_query(F.data.in_({"thinking:prev", "thinking:next"}))
-async def thinking_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
+async def legacy_thinking_cycle_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
 
     levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
+    if len(levels) < 2:
+        await query.answer()
+        return
+
     current_level = _effective_thinking_level(app_context, app_context.config.codex_model)
     current_index = levels.index(current_level) if current_level in levels else 0
     direction = -1 if query.data == "thinking:prev" else 1
     next_level = levels[(current_index + direction) % len(levels)]
     await _set_codex_preferences(app_context, thinking_level=next_level)
-    await _show_dashboard_from_callback(query, app_context, page="model")
+    await _refresh_quick_controls_target(query, app_context)
     await query.answer(f"Thinking: {thinking_label(next_level)}")
 
 
@@ -607,7 +596,7 @@ async def branch_select_callback(query: CallbackQuery, app_context: AppContext) 
 
 
 @router.callback_query(F.data.startswith("codexmodel:select:"))
-async def codexmodel_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
+async def legacy_codexmodel_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
 
@@ -628,12 +617,12 @@ async def codexmodel_select_callback(query: CallbackQuery, app_context: AppConte
         codex_model=target_model,
         thinking_level=_effective_thinking_level(app_context, target_model),
     )
-    await _show_dashboard_from_callback(query, app_context, page="model")
+    await _refresh_quick_controls_target(query, app_context)
     await query.answer(f"Model: {model_label(target_model)}")
 
 
 @router.callback_query(F.data.startswith("thinking:select:"))
-async def thinking_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
+async def legacy_thinking_select_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
         return
 
@@ -650,7 +639,7 @@ async def thinking_select_callback(query: CallbackQuery, app_context: AppContext
 
     target_level = levels[index]
     await _set_codex_preferences(app_context, thinking_level=target_level)
-    await _show_dashboard_from_callback(query, app_context, page="model")
+    await _refresh_quick_controls_target(query, app_context)
     await query.answer(f"Thinking: {thinking_label(target_level)}")
 
 
@@ -966,49 +955,71 @@ async def update_run_callback(query: CallbackQuery, app_context: AppContext) -> 
     if query.message is None or query.from_user is None:
         await query.answer("Unable to update the bot.", show_alert=True)
         return
+    if app_context.update_task and not app_context.update_task.done():
+        await query.answer("Bot update is already running.", show_alert=True)
+        return
 
     update_state = await _get_bot_update_state(app_context, force=True)
     if not update_state.update_available:
-        await _show_dashboard_from_callback(query, app_context, page="settings")
         await query.answer("You're already up to date.", show_alert=True)
-        return
-
-    old_commit = update_state.installed_commit
-    new_commit = update_state.latest_commit
-    latest_version = update_state.latest_version
-    latest_notes = update_state.latest_notes
-
-    await query.answer("Updating bot…")
-    async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
-        results = await app_context.queue.submit(
-            f"bot update by {query.from_user.id}",
-            app_context.runner.install_self_update,
-        )
-
-    update_ok = all(result.ok for _, result in results)
-    app_context.cached_update_state = None
-    app_context.update_checked_at = 0.0
-
-    if not update_ok:
-        app_context.flash_message = "❌ Bot update failed"
         await _show_dashboard_from_callback(query, app_context, page="settings")
         return
 
-    await _edit_dashboard_message(
-        query.message,
-        "<b>Updating bot</b>\n\nUpdate installed. Restarting the service now…",
-        None,
+    app_context.update_progress = BotUpdateProgress(
+        awaiting_confirmation=True,
+        percent=0,
+        status_text="Waiting for confirmation",
+        target_version=update_state.latest_version,
+        latest_summary=update_state.latest_summary,
+        latest_notes=update_state.latest_notes,
+        old_commit=update_state.installed_commit,
+        new_commit=update_state.latest_commit,
     )
-    await _schedule_post_update_notice(
-        app_context,
-        chat_id=query.message.chat.id,
-        user_id=query.from_user.id,
-        old_commit=old_commit,
-        new_commit=new_commit,
-        version=latest_version,
-        notes=latest_notes,
+    await query.answer("Review the update details below.")
+    await _show_dashboard_from_callback(query, app_context, page="settings")
+
+
+@router.callback_query(F.data == "update:cancel")
+async def update_cancel_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    app_context.update_progress = None
+    await query.answer("Update cancelled.")
+    await _show_dashboard_from_callback(query, app_context, page="settings")
+
+
+@router.callback_query(F.data == "update:confirm")
+async def update_confirm_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    if query.message is None or query.from_user is None:
+        await query.answer("Unable to start the update.", show_alert=True)
+        return
+
+    progress = app_context.update_progress
+    if progress is None or not progress.awaiting_confirmation:
+        await query.answer("No update is waiting for confirmation.", show_alert=True)
+        await _show_dashboard_from_callback(query, app_context, page="settings")
+        return
+    if app_context.update_task and not app_context.update_task.done():
+        await query.answer("Bot update is already running.", show_alert=True)
+        return
+
+    progress.awaiting_confirmation = False
+    progress.in_progress = True
+    progress.percent = 5
+    progress.status_text = "Preparing update"
+    progress.error_text = None
+    await query.answer("Starting update…")
+    await _show_dashboard_from_callback(query, app_context, page="settings")
+    app_context.update_task = asyncio.create_task(
+        _perform_bot_update(
+            app_context,
+            bot=query.bot,
+            chat_id=query.message.chat.id,
+            user_id=query.from_user.id,
+        )
     )
-    await app_context.runner.trigger_service_restart()
 
 
 @router.callback_query(F.data == "root:change")
@@ -1274,6 +1285,33 @@ def _effective_thinking_level(app_context: AppContext, model_slug: str) -> str:
         return current
     default_level = _default_thinking_for_model(app_context, model_slug)
     return default_level if default_level in levels else levels[0]
+
+
+def _render_update_progress_block(progress: BotUpdateProgress | None) -> str | None:
+    if progress is None:
+        return None
+
+    percent = max(0, min(progress.percent, 100))
+    filled = min(10, max(0, round(percent / 10)))
+    bar = f"[{'#' * filled}{'·' * (10 - filled)}] {percent}%"
+    lines = [
+        "<b>Bot update</b>",
+        f"Status: <code>{html.escape(progress.status_text or 'Idle')}</code>",
+        f"Progress: <code>{bar}</code>",
+    ]
+    if progress.target_version:
+        lines.append(f"Target version: <code>{html.escape(progress.target_version)}</code>")
+    if progress.awaiting_confirmation:
+        lines.append("")
+        lines.append("Confirm the update below.")
+    if progress.awaiting_confirmation and progress.latest_notes:
+        lines.append("")
+        lines.append("<b>Update details</b>")
+        lines.extend(f"• {html.escape(note)}" for note in progress.latest_notes[:3])
+    if progress.error_text:
+        lines.append("")
+        lines.append(f"<blockquote>{html.escape(progress.error_text)}</blockquote>")
+    return "\n".join(lines)
 
 
 def _effective_selected_models(app_context: AppContext) -> list[str]:
@@ -1773,13 +1811,19 @@ async def _edit_dashboard_message(
 
 
 async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]:
-    projects = await _projects_with_active_selection(app_context)
-    project_names = [project.name for project in projects]
-    active_index = _active_project_index(app_context, projects)
-    branch_names, current_branch = await _git_branches_for_active_project(app_context)
-    active_branch_index = branch_names.index(current_branch) if current_branch in branch_names else None
+    projects: list[WorkspaceProject] = []
+    project_names: list[str] = []
+    active_index: int | None = None
+    branch_names: list[str] = []
+    active_branch_index: int | None = None
+    if page in {"home", "repos", "branches", "workspaces_root"}:
+        projects = await _projects_with_active_selection(app_context)
+        project_names = [project.name for project in projects]
+        active_index = _active_project_index(app_context, projects)
+        branch_names, current_branch = await _git_branches_for_active_project(app_context)
+        active_branch_index = branch_names.index(current_branch) if current_branch in branch_names else None
+
     selected_models = _effective_selected_models(app_context)
-    thinking_levels = _thinking_levels_for_model(app_context, app_context.config.codex_model)
     active_thinking_level = _effective_thinking_level(app_context, app_context.config.codex_model)
 
     if page == "home":
@@ -1865,85 +1909,22 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
             ),
         )
 
-    if page == "model":
-        return (
-            build_model_text(
-                current_model=app_context.config.codex_model,
-                current_thinking_level=active_thinking_level,
-                showing_model_list=False,
-                showing_thinking_list=False,
-            ),
-            model_keyboard(
-                models=selected_models,
-                active_model_index=selected_models.index(app_context.config.codex_model)
-                if app_context.config.codex_model in selected_models
-                else None,
-                thinking_levels=thinking_levels,
-                active_thinking_index=thinking_levels.index(active_thinking_level)
-                if active_thinking_level in thinking_levels
-                else None,
-                showing_model_list=False,
-                showing_thinking_list=False,
-            ),
-        )
-
-    if page == "models":
-        return (
-            build_model_text(
-                current_model=app_context.config.codex_model,
-                current_thinking_level=active_thinking_level,
-                showing_model_list=True,
-                showing_thinking_list=False,
-            ),
-            model_keyboard(
-                models=selected_models,
-                active_model_index=selected_models.index(app_context.config.codex_model)
-                if app_context.config.codex_model in selected_models
-                else None,
-                thinking_levels=thinking_levels,
-                active_thinking_index=thinking_levels.index(active_thinking_level)
-                if active_thinking_level in thinking_levels
-                else None,
-                showing_model_list=True,
-                showing_thinking_list=False,
-            ),
-        )
-
-    if page == "thinking":
-        return (
-            build_model_text(
-                current_model=app_context.config.codex_model,
-                current_thinking_level=active_thinking_level,
-                showing_model_list=False,
-                showing_thinking_list=True,
-            ),
-            model_keyboard(
-                models=selected_models,
-                active_model_index=selected_models.index(app_context.config.codex_model)
-                if app_context.config.codex_model in selected_models
-                else None,
-                thinking_levels=thinking_levels,
-                active_thinking_index=thinking_levels.index(active_thinking_level)
-                if active_thinking_level in thinking_levels
-                else None,
-                showing_model_list=False,
-                showing_thinking_list=True,
-            ),
-        )
-
     if page == "settings":
         auth_state = await _get_auth_state(app_context)
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
+        update_progress = app_context.update_progress
         return (
             build_settings_text(
                 auth_state=auth_state,
                 whisper_state=whisper_state,
                 update_state=update_state,
                 workspaces_root=app_context.config.workspaces_root,
+                update_progress_block=_render_update_progress_block(update_progress),
             ),
             settings_keyboard(
-                update_busy=bool(app_context.queue.active_label and app_context.queue.active_label.startswith("bot update")),
+                update_busy=bool(update_progress and update_progress.in_progress),
+                update_confirm_pending=bool(update_progress and update_progress.awaiting_confirmation),
             ),
         )
 
@@ -2128,6 +2109,101 @@ async def _schedule_post_update_notice(
     save_update_notice(app_context.config.config_file.parent / "update_notice.json", notice)
 
 
+async def _perform_bot_update(
+    app_context: AppContext,
+    *,
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    progress = app_context.update_progress
+    if progress is None:
+        return
+
+    try:
+        progress.in_progress = True
+        progress.awaiting_confirmation = False
+        progress.percent = 10
+        progress.status_text = "Downloading the installer"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        results = await app_context.queue.submit(
+            f"bot update by {user_id}",
+            lambda: app_context.runner.install_self_update(progress.new_commit),
+        )
+        app_context.cached_update_state = None
+        app_context.update_checked_at = 0.0
+
+        failed_result = next((result for _, result in results if not result.ok), None)
+        if failed_result is not None:
+            progress.in_progress = False
+            progress.percent = 100
+            progress.status_text = "Update failed"
+            progress.error_text = (failed_result.stderr or failed_result.stdout or "Unknown update error.")[:600]
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+            return
+
+        progress.percent = 75
+        progress.status_text = "Reinstalling the background service"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        await _schedule_post_update_notice(
+            app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            old_commit=progress.old_commit,
+            new_commit=progress.new_commit,
+            version=progress.target_version,
+            notes=progress.latest_notes,
+        )
+
+        progress.percent = 100
+        progress.status_text = "Update installed. Restarting the service"
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=chat_id,
+            user_id=user_id,
+            page="settings",
+        )
+
+        await asyncio.sleep(0.5)
+        await app_context.runner.trigger_service_reinstall()
+    except Exception as exc:
+        logger.exception("Bot self-update failed.")
+        if app_context.update_progress is not None:
+            app_context.update_progress.in_progress = False
+            app_context.update_progress.percent = 100
+            app_context.update_progress.status_text = "Update failed"
+            app_context.update_progress.error_text = str(exc)
+        with suppress(Exception):
+            await _refresh_dashboard_for_chat(
+                bot=bot,
+                app_context=app_context,
+                chat_id=chat_id,
+                user_id=user_id,
+                page="settings",
+            )
+
+
 async def _sync_admin_label_from_message(message: Message, app_context: AppContext) -> None:
     user_id = message.from_user.id if message.from_user else None
     if user_id is None or user_id not in app_context.config.admin_ids:
@@ -2204,3 +2280,10 @@ def _extract_device_auth_view(raw_output: str | None) -> DeviceAuthView | None:
 
 def _strip_ansi(value: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", value).replace("[0m", "").replace("[90m", "").replace("[94m", "")
+
+
+@router.callback_query(F.data.in_({"codexmodel:noop", "thinking:noop"}))
+async def legacy_model_noop_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    await query.answer()

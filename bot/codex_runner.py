@@ -5,6 +5,7 @@ import base64
 import importlib.metadata
 import json
 import logging
+import os
 import shlex
 import shutil
 import sys
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 WHISPER_MODEL_NAME = "tiny"
 WHISPER_PIP_PACKAGE = "faster-whisper"
-SELF_REPO_URL = "git+https://github.com/jekakiev/ex-cod-tg.git@main"
+SELF_REPO_GIT_BASE = "git+https://github.com/jekakiev/ex-cod-tg.git"
 GITHUB_COMMITS_API = "https://api.github.com/repos/jekakiev/ex-cod-tg/commits/"
 RAW_GITHUB_BASE = "https://raw.githubusercontent.com/jekakiev/ex-cod-tg"
 MODEL_ALIAS_MAP = {
@@ -219,7 +220,37 @@ class CodexRunner:
         return WHISPER_MODEL_NAME
 
     def current_executable_path(self) -> Path:
-        return Path(sys.executable).resolve().parent / "ex-cod-tg"
+        platform_install_path: Path
+        if sys.platform == "darwin":
+            platform_install_path = Path.home() / "Library" / "Application Support" / "ex-cod-tg" / "app" / "venv" / "bin" / "ex-cod-tg"
+        else:
+            data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+            platform_install_path = data_home / "ex-cod-tg" / "app" / "venv" / "bin" / "ex-cod-tg"
+
+        candidates: list[Path] = []
+        argv0 = Path(sys.argv[0]).expanduser()
+        if argv0.name == "ex-cod-tg":
+            candidates.append(argv0.resolve(strict=False))
+
+        candidates.append(Path(sys.executable).resolve().parent / "ex-cod-tg")
+
+        which_path = shutil.which("ex-cod-tg")
+        if which_path:
+            candidates.append(Path(which_path).resolve(strict=False))
+
+        candidates.append((Path.home() / ".local" / "bin" / "ex-cod-tg").resolve(strict=False))
+        candidates.append(platform_install_path.resolve(strict=False))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
+
+        return platform_install_path.resolve(strict=False)
 
     async def collect_codex_auth_state(self) -> CodexAuthState:
         cli_path = self.codex_path()
@@ -510,26 +541,83 @@ class CodexRunner:
             ("remove cached whisper models", cleanup_result),
         ]
 
-    async def install_self_update(self) -> list[tuple[str, CommandResult]]:
-        pip_result = await self._run_process(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-cache-dir", SELF_REPO_URL],
+    async def install_self_update(self, ref: str | None = None) -> list[tuple[str, CommandResult]]:
+        target_ref = (ref or "main").strip() or "main"
+        script_result, installer_path = await asyncio.to_thread(self._download_update_installer, target_ref)
+        if not script_result.ok or installer_path is None:
+            return [(f"download install.sh ({target_ref})", script_result)]
+
+        repo_url = f"{SELF_REPO_GIT_BASE}@{target_ref}"
+        install_result = await self._run_process(
+            [
+                "/usr/bin/env",
+                "EX_COD_TG_SKIP_SERVICE_INSTALL=1",
+                f"EX_COD_TG_REPO_URL={repo_url}",
+                "/bin/bash",
+                str(installer_path),
+            ],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=1800,
         )
-        return [("pip install --upgrade ex-cod-tg", pip_result)]
 
-    async def trigger_service_restart(self) -> None:
+        with suppress(OSError):
+            installer_path.unlink()
+
+        return [
+            (f"download install.sh ({target_ref})", script_result),
+            ("run install.sh", install_result),
+        ]
+
+    async def trigger_service_reinstall(self) -> None:
         executable = self.current_executable_path()
         if not executable.exists():
             raise RuntimeError(f"CLI executable not found: {executable}")
         await asyncio.create_subprocess_exec(
             str(executable),
             "service",
-            "restart",
+            "install",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
         )
+
+    def _download_update_installer(self, ref: str) -> tuple[CommandResult, Path | None]:
+        url = f"{RAW_GITHUB_BASE}/{ref}/install.sh"
+        started_at = time.perf_counter()
+        fd, temp_name = tempfile.mkstemp(prefix="ex-cod-tg-install-", suffix=".sh")
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                payload = response.read()
+            temp_path.write_bytes(payload)
+            temp_path.chmod(0o755)
+            return (
+                CommandResult(
+                    command=f"download {url}",
+                    cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+                    exit_code=0,
+                    stdout=str(temp_path),
+                    stderr="",
+                    duration_seconds=time.perf_counter() - started_at,
+                ),
+                temp_path,
+            )
+        except Exception as exc:
+            with suppress(OSError):
+                temp_path.unlink()
+            return (
+                CommandResult(
+                    command=f"download {url}",
+                    cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+                    exit_code=1,
+                    stdout="",
+                    stderr=str(exc),
+                    duration_seconds=time.perf_counter() - started_at,
+                    error=str(exc),
+                ),
+                None,
+            )
 
     async def transcribe_voice_file(self, audio_path: Path) -> VoiceTranscriptionResult:
         if not audio_path.exists():

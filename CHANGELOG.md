@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Bot update flow now asks for confirmation, shows progress in Settings, and reinstalls the service instead of only restarting it.
+- Settings and navigation callbacks acknowledge taps faster and avoid expensive repo and branch scans on unrelated pages.
+- Update notices are now more reliable after background service restarts.
+- Model and thinking switches now stay inline on the dashboard and under replies, with the old dedicated model page removed.
+- In-bot updates now reuse the same installer flow as the public `install.sh` command to avoid drift between manual and Telegram updates.
+
 ## 0.1.3
 
 - Selected models now come from the live local Codex CLI catalog and are shown two per row.

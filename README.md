@@ -69,9 +69,6 @@ The only thing you need to enter in the terminal is your Telegram bot token.
 
 - `/start` — open the main dashboard
 - `/help` — show help
-- `/status` — refresh the dashboard
-- `/model` — choose the Codex model and thinking level
-- `/admins` — open admin management
 - `/ask <text>` — send a prompt to Codex
 - `/fix <task>` — ask Codex to fix something
 - `/run <command>` — run a restricted shell command
@@ -80,6 +77,8 @@ The only thing you need to enter in the terminal is your Telegram bot token.
 - `/log` — show recent commits
 
 Plain text messages also work: just send a task in chat and Codex will start.
+
+Model and thinking level are switched directly from the Telegram buttons on the dashboard and under each Codex reply.
 
 Voice messages also work when Whisper is installed: the bot transcribes them locally, shows the text for confirmation, and only runs Codex after approval.
 
