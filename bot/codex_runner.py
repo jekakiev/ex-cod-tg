@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -112,6 +113,7 @@ class CodexAuthState:
 class CodexStreamResult:
     result: CommandResult
     final_text: str
+    session_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -797,6 +799,7 @@ class CodexRunner:
         prompt: str,
         *,
         image_paths: list[Path] | tuple[Path, ...] | None = None,
+        resume_session_id: str | None = None,
         on_update: Callable[[str], Awaitable[None]] | None = None,
     ) -> CodexStreamResult:
         prompt = prompt.strip()
@@ -837,6 +840,13 @@ class CodexRunner:
             )
             return CodexStreamResult(result=result, final_text="")
 
+        if resume_session_id:
+            return await self._run_codex_resume_streaming_prompt(
+                prompt,
+                resume_session_id=resume_session_id,
+                on_update=on_update,
+            )
+
         output_file = Path(tempfile.gettempdir()) / f"ex-cod-tg-codex-last-{int(time.time() * 1000)}.txt"
         args = [
             self.config.codex_bin,
@@ -860,6 +870,7 @@ class CodexRunner:
         args.append(prompt)
         command_display = shlex.join(args)
         started_at = time.perf_counter()
+        started_at_epoch = time.time()
         self._logger.info("Running streaming Codex command in %s: %s", self.config.working_dir, command_display)
 
         try:
@@ -882,6 +893,7 @@ class CodexRunner:
         raw_stdout_parts: list[str] = []
         stdout_buffer = ""
         stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        session_id: str | None = None
         last_emit_at = 0.0
         last_payload = ""
 
@@ -936,6 +948,8 @@ class CodexRunner:
                         stdout_buffer = lines[-1] if lines else stdout_buffer
 
                     for raw_line in complete_lines:
+                        if session_id is None:
+                            session_id = _extract_session_id_from_stream_line(raw_line)
                         event = _parse_codex_stream_event(raw_line)
                         if event is None:
                             continue
@@ -980,6 +994,11 @@ class CodexRunner:
         if not final_text:
             final_text = stream_state.assistant_text.strip() or stream_state.preview_text
 
+        if session_id is None and not resume_session_id:
+            session_id = await asyncio.to_thread(self._recover_recent_session_id, started_at_epoch)
+        if session_id is None and resume_session_id and exit_code == 0 and not timed_out:
+            session_id = resume_session_id
+
         if timed_out:
             stderr = (
                 f"Command timed out after {self.config.command_timeout_seconds} seconds.\n\n{stderr}".strip()
@@ -1004,7 +1023,142 @@ class CodexRunner:
             timed_out=timed_out,
         )
         await emit(stream_state.preview_text, force=True)
-        return CodexStreamResult(result=result, final_text=final_text)
+        return CodexStreamResult(result=result, final_text=final_text, session_id=session_id)
+
+    async def _run_codex_resume_streaming_prompt(
+        self,
+        prompt: str,
+        *,
+        resume_session_id: str,
+        on_update: Callable[[str], Awaitable[None]] | None,
+    ) -> CodexStreamResult:
+        args = [
+            self.config.codex_bin,
+            "exec",
+            "resume",
+            "-c",
+            f'model="{self.config.codex_model}"',
+            "-c",
+            f'model_reasoning_effort="{self.config.codex_thinking_level}"',
+            resume_session_id,
+            prompt,
+        ]
+        command_display = shlex.join(args)
+        started_at = time.perf_counter()
+        self._logger.info("Running resumed Codex command in %s: %s", self.config.working_dir, command_display)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=str(self.config.working_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            result = self._synthetic_error_result(
+                args,
+                f"Executable not found: {self.config.codex_bin}",
+                exit_code=127,
+            )
+            return CodexStreamResult(result=result, final_text="", session_id=resume_session_id)
+
+        stdout_parts: list[str] = []
+        stderr_lines: list[str] = []
+        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        last_emit_at = 0.0
+        last_payload = ""
+        session_id = resume_session_id
+
+        async def emit(payload: str, force: bool = False) -> None:
+            nonlocal last_emit_at
+            nonlocal last_payload
+            if on_update is None:
+                return
+            payload = payload.strip()
+            if not payload:
+                return
+            if payload == last_payload:
+                return
+            now = time.monotonic()
+            if not force and now - last_emit_at < 0.03:
+                return
+            await on_update(payload)
+            last_emit_at = now
+            last_payload = payload
+
+        async def read_stderr() -> None:
+            if process.stderr is None:
+                return
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                stderr_lines.append(line.decode("utf-8", errors="replace"))
+
+        stderr_task = asyncio.create_task(read_stderr())
+        timed_out = False
+        try:
+            if process.stdout is not None:
+                while True:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(128),
+                        timeout=self.config.command_timeout_seconds,
+                    )
+                    if not chunk:
+                        break
+                    decoded = stdout_decoder.decode(chunk, final=False)
+                    stdout_parts.append(decoded)
+                    current_stdout = "".join(stdout_parts)
+                    maybe_session_id = _extract_resume_session_id(current_stdout)
+                    if maybe_session_id:
+                        session_id = maybe_session_id
+                    preview = _extract_resume_assistant_text(current_stdout)
+                    if preview:
+                        await emit(preview)
+                trailing = stdout_decoder.decode(b"", final=True)
+                if trailing:
+                    stdout_parts.append(trailing)
+            await asyncio.wait_for(process.wait(), timeout=self.config.command_timeout_seconds)
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            with suppress(ProcessLookupError):
+                await process.wait()
+        finally:
+            with suppress(asyncio.CancelledError):
+                await stderr_task
+
+        duration_seconds = time.perf_counter() - started_at
+        exit_code = process.returncode if not timed_out else -1
+        stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_lines)
+        final_text = _extract_resume_assistant_text(stdout).strip()
+
+        if timed_out:
+            stderr = (
+                f"Command timed out after {self.config.command_timeout_seconds} seconds.\n\n{stderr}".strip()
+                if stderr
+                else f"Command timed out after {self.config.command_timeout_seconds} seconds."
+            )
+        elif exit_code != 0:
+            self._logger.warning(
+                "Resumed command failed with exit code %s in %s: %s",
+                exit_code,
+                self.config.working_dir,
+                command_display,
+            )
+
+        result = CommandResult(
+            command=command_display,
+            cwd=self.config.working_dir,
+            exit_code=exit_code,
+            stdout=final_text or stdout,
+            stderr=stderr,
+            duration_seconds=duration_seconds,
+            timed_out=timed_out,
+        )
+        await emit(final_text, force=True)
+        return CodexStreamResult(result=result, final_text=final_text, session_id=session_id)
 
     async def run_shell_command(self, args: list[str]) -> CommandResult:
         if not self.config.working_dir_exists:
@@ -1291,6 +1445,33 @@ class CodexRunner:
             return "API key"
         return None
 
+    def _recover_recent_session_id(self, started_at_epoch: float) -> str | None:
+        session_index = Path.home() / ".codex" / "session_index.jsonl"
+        try:
+            lines = session_index.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+
+        threshold = started_at_epoch - 2.0
+        for raw_line in reversed(lines):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                payload = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            session_id = str(payload.get("id") or "").strip()
+            updated_at = str(payload.get("updated_at") or "").strip()
+            if not session_id or not updated_at:
+                continue
+            updated_epoch = _parse_codex_iso_timestamp(updated_at)
+            if updated_epoch is None:
+                continue
+            if updated_epoch >= threshold:
+                return session_id
+        return None
+
     def _summarize_auth_status(
         self,
         *,
@@ -1554,3 +1735,56 @@ def _is_low_value_stream_text(value: str) -> bool:
         "working…",
         "working...",
     }
+
+
+def _extract_session_id_from_stream_line(raw_line: str) -> str | None:
+    line = raw_line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    event_type = str(payload.get("type") or "").strip().lower()
+    if event_type != "thread.started":
+        return None
+    thread_id = str(payload.get("thread_id") or "").strip()
+    return thread_id or None
+
+
+def _parse_codex_iso_timestamp(value: str) -> float | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _extract_resume_session_id(stdout_text: str) -> str | None:
+    match = re.search(r"session id:\s*([0-9a-fA-F-]{8,})", stdout_text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_resume_assistant_text(stdout_text: str) -> str:
+    if not stdout_text:
+        return ""
+    normalized = stdout_text.replace("\r\n", "\n")
+    marker = "\ncodex\n"
+    marker_index = normalized.find(marker)
+    if marker_index < 0:
+        return ""
+    assistant_section = normalized[marker_index + len(marker) :]
+    footer_index = assistant_section.find("\ntokens used\n")
+    if footer_index >= 0:
+        assistant_section = assistant_section[:footer_index]
+    cleaned = assistant_section.strip()
+    if not cleaned:
+        return ""
+
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if len(lines) >= 2 and lines[-1].strip() == lines[-2].strip():
+        lines.pop()
+    return "\n".join(lines).strip()

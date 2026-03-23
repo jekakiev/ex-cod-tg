@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 from bot.app_paths import get_app_paths
+from bot.conversation_store import BranchConversationStore
 from bot.codex_runner import AsyncCommandQueue, CodexRunner
 from bot.config import AppConfig, ConfigError
 from bot.handlers import AppContext, router, send_fresh_dashboard_for_chat
@@ -21,6 +22,7 @@ from bot.update_notice_store import clear_update_notice, load_update_notice
 BOT_COMMANDS = [
     BotCommand(command="start", description="Open the main menu"),
     BotCommand(command="help", description="Show available commands"),
+    BotCommand(command="reset_context", description="Reset saved Codex context for the current branch"),
     BotCommand(command="run", description="Run a safe shell command"),
     BotCommand(command="diff", description="Show the current git diff"),
     BotCommand(command="log", description="Show recent git commits"),
@@ -59,6 +61,7 @@ async def run_bot(config: AppConfig, *, log_file: Path) -> None:
         config=config,
         runner=CodexRunner(config),
         queue=queue,
+        conversation_store=BranchConversationStore(paths.config_dir / "branch_conversations.json"),
     )
 
     bot = Bot(

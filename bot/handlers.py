@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from bot.codex_runner import (
@@ -30,6 +30,7 @@ from bot.codex_runner import (
     WhisperState,
     normalize_model_slug,
 )
+from bot.conversation_store import BranchConversationState, BranchConversationStore, ConversationSummary, NO_GIT_BRANCH_KEY
 from bot.config_store import (
     add_admin_id,
     remove_admin_id,
@@ -148,6 +149,25 @@ class PendingImageRequest:
 
 
 @dataclass(slots=True)
+class PendingResetRequest:
+    owner_user_id: int
+    owner_chat_id: int
+    repo_path: Path
+    branch_name: str
+    branch_label: str
+
+
+@dataclass(slots=True)
+class BranchExecutionContext:
+    repo_path: Path
+    branch_name: str
+    branch_label: str
+    head_sha: str | None
+    git_repo: bool
+    saved_state: BranchConversationState | None
+
+
+@dataclass(slots=True)
 class BotUpdateProgress:
     awaiting_confirmation: bool = False
     in_progress: bool = False
@@ -174,11 +194,13 @@ class AppContext:
     config: AppConfig
     runner: CodexRunner
     queue: AsyncCommandQueue
+    conversation_store: BranchConversationStore
     admin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ui_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dashboards: dict[int, DashboardSession] = field(default_factory=dict)
     pending_admin_request: PendingAdminRequest | None = None
     pending_workspaces_root_request: PendingWorkspacesRootRequest | None = None
+    pending_reset_request: PendingResetRequest | None = None
     pending_voice_requests: dict[str, PendingVoiceRequest] = field(default_factory=dict)
     pending_image_requests: dict[int, PendingImageRequest] = field(default_factory=dict)
     codex_login_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -204,6 +226,7 @@ HELP_TEXT = """
 <b>Available commands</b>
 <code>/start</code> Open a fresh main menu message
 <code>/help</code> Show this help message
+<code>/reset_context</code> Reset the saved Codex context for the current repo and git branch
 <code>&lt;plain message&gt;</code> Chat with Codex in the active repository
 <code>&lt;photo/image file&gt;</code> Send with a caption, or send text next to use it as input for Codex
 <code>&lt;voice message&gt;</code> Transcribe locally with Whisper, then approve before running Codex
@@ -255,6 +278,78 @@ async def help_command(message: Message, app_context: AppContext) -> None:
     if not await _ensure_authorized_message(message, app_context):
         return
     await message.answer(HELP_TEXT)
+
+
+@router.message(Command("reset_context"))
+async def reset_context_command(message: Message, app_context: AppContext) -> None:
+    if not await _ensure_authorized_message(message, app_context):
+        return
+    if message.from_user is None:
+        return
+
+    context = await _current_branch_execution_context(app_context)
+    app_context.pending_reset_request = PendingResetRequest(
+        owner_user_id=message.from_user.id,
+        owner_chat_id=message.chat.id,
+        repo_path=context.repo_path,
+        branch_name=context.branch_name,
+        branch_label=context.branch_label,
+    )
+    await message.answer(
+        (
+            "<b>Reset Codex context?</b>\n\n"
+            f"Repo: <code>{html.escape(context.repo_path.name or str(context.repo_path))}</code>\n"
+            f"Branch: <code>{html.escape(context.branch_label)}</code>\n\n"
+            "This clears the saved session id and short branch summary. "
+            "Your next message will start a fresh Codex session from the current HEAD."
+        ),
+        reply_markup=_reset_context_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "reset_context:confirm")
+async def reset_context_confirm_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    pending = app_context.pending_reset_request
+    if pending is None:
+        await query.answer("This reset request is no longer active.", show_alert=True)
+        return
+    if query.from_user is None or query.from_user.id != pending.owner_user_id:
+        await query.answer("Only the original requester can confirm this reset.", show_alert=True)
+        return
+
+    app_context.pending_reset_request = None
+    removed = app_context.conversation_store.clear(pending.repo_path, pending.branch_name)
+    await query.answer("Context reset." if removed else "No saved context was found.", show_alert=False)
+    if query.message is not None:
+        await _edit_streaming_message(
+            query.message,
+            (
+                "<b>Codex context reset</b>\n\n"
+                f"Repo: <code>{html.escape(pending.repo_path.name or str(pending.repo_path))}</code>\n"
+                f"Branch: <code>{html.escape(pending.branch_label)}</code>\n\n"
+                "The next message will start a fresh Codex session."
+            ),
+        )
+
+
+@router.callback_query(F.data == "reset_context:cancel")
+async def reset_context_cancel_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    pending = app_context.pending_reset_request
+    if pending is None:
+        await query.answer("Nothing to cancel.", show_alert=True)
+        return
+    if query.from_user is None or query.from_user.id != pending.owner_user_id:
+        await query.answer("Only the original requester can cancel this reset.", show_alert=True)
+        return
+
+    app_context.pending_reset_request = None
+    await query.answer("Reset cancelled.", show_alert=False)
+    if query.message is not None:
+        await _edit_streaming_message(query.message, "Context reset cancelled.")
 
 @router.message(Command("run"))
 async def run_command(message: Message, command: CommandObject, app_context: AppContext) -> None:
@@ -1530,6 +1625,221 @@ async def _run_codex_chat(
     )
 
 
+def _reset_context_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm", callback_data="reset_context:confirm"),
+                InlineKeyboardButton(text="❌ Cancel", callback_data="reset_context:cancel"),
+            ]
+        ]
+    )
+
+
+async def _current_branch_execution_context(app_context: AppContext) -> BranchExecutionContext:
+    repo_path = app_context.config.working_dir.resolve(strict=False)
+    probe = await app_context.runner.run_git_command(
+        ["rev-parse", "--is-inside-work-tree"],
+        timeout=15,
+        log_command=False,
+    )
+    if not probe.ok or probe.stdout.strip() != "true":
+        saved_state = app_context.conversation_store.get(repo_path, NO_GIT_BRANCH_KEY)
+        return BranchExecutionContext(
+            repo_path=repo_path,
+            branch_name=NO_GIT_BRANCH_KEY,
+            branch_label="workspace",
+            head_sha=None,
+            git_repo=False,
+            saved_state=saved_state,
+        )
+
+    branch_result = await app_context.runner.run_git_command(
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        timeout=15,
+        log_command=False,
+    )
+    head_result = await app_context.runner.run_git_command(
+        ["rev-parse", "HEAD"],
+        timeout=15,
+        log_command=False,
+    )
+    branch_name = branch_result.stdout.strip() if branch_result.ok and branch_result.stdout.strip() else "HEAD"
+    head_sha = head_result.stdout.strip() if head_result.ok and head_result.stdout.strip() else None
+    saved_state = app_context.conversation_store.get(repo_path, branch_name)
+    return BranchExecutionContext(
+        repo_path=repo_path,
+        branch_name=branch_name,
+        branch_label=branch_name,
+        head_sha=head_sha,
+        git_repo=True,
+        saved_state=saved_state,
+    )
+
+
+def _build_context_prefix(summary: ConversationSummary | None) -> str:
+    if summary is None:
+        return ""
+
+    lines: list[str] = []
+    if summary.request:
+        lines.append(f"request: {summary.request}")
+    if summary.done:
+        lines.append(f"done: {summary.done}")
+    if summary.next:
+        lines.append(f"next: {summary.next}")
+    if not lines:
+        return ""
+
+    return (
+        "Previous branch context:\n"
+        + "\n".join(lines)
+        + "\n\nUse this only as compact context from earlier work on the same branch.\n\n"
+    )
+
+
+def _build_conversation_summary(*, prompt: str, final_text: str) -> ConversationSummary:
+    request = _clip_summary_text(prompt, limit=220)
+    done = _clip_summary_text(_summary_first_line(final_text), limit=320)
+    next_value = _clip_summary_text(_summary_last_line(final_text), limit=220)
+    if not next_value:
+        next_value = "Continue from the current repository state on this branch."
+    return ConversationSummary(
+        request=request,
+        done=done,
+        next=next_value,
+    )
+
+
+def _summary_first_line(text: str) -> str:
+    for chunk in re.split(r"\n{2,}|\n", text):
+        cleaned = " ".join(chunk.split()).strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _summary_last_line(text: str) -> str:
+    parts = [
+        " ".join(chunk.split()).strip()
+        for chunk in re.split(r"\n{2,}|\n", text)
+        if " ".join(chunk.split()).strip()
+    ]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return ""
+    return parts[-1]
+
+
+def _clip_summary_text(value: str, *, limit: int) -> str:
+    normalized = " ".join(value.split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    clipped = normalized[: limit - 1].rstrip()
+    cutoff = clipped.rfind(" ")
+    if cutoff >= max(limit // 2, 24):
+        clipped = clipped[:cutoff]
+    return f"{clipped}…"
+
+
+def _looks_like_resume_session_failure(error_text: str) -> bool:
+    normalized = error_text.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "session",
+            "thread",
+            "conversation",
+            "resume",
+            "not found",
+            "does not exist",
+            "unknown",
+            "invalid value",
+            "invalid uuid",
+        )
+    )
+
+
+def _persist_branch_conversation_state(
+    app_context: AppContext,
+    *,
+    context: BranchExecutionContext,
+    prompt: str,
+    result: Any,
+    session_id_override: str | None = None,
+) -> None:
+    if not result.result.ok:
+        return
+
+    session_id = session_id_override if session_id_override is not None else result.session_id
+    summary = _build_conversation_summary(prompt=prompt, final_text=result.final_text)
+    app_context.conversation_store.set(
+        repo_path=context.repo_path,
+        branch_name=context.branch_name,
+        session_id=session_id,
+        last_seen_head=context.head_sha,
+        summary=summary,
+    )
+
+
+async def _run_branch_scoped_codex_prompt(
+    *,
+    app_context: AppContext,
+    prompt: str,
+    image_paths: list[Path],
+    on_update: Callable[[str], Awaitable[None]] | None,
+) -> Any:
+    context = await _current_branch_execution_context(app_context)
+    saved_state = context.saved_state
+    context_prefix = _build_context_prefix(saved_state.summary if saved_state is not None else None)
+
+    if image_paths:
+        image_prompt = f"{context_prefix}{prompt}" if context_prefix else prompt
+        result = await app_context.runner.run_codex_streaming_prompt(
+            image_prompt,
+            image_paths=image_paths,
+            on_update=on_update,
+        )
+        _persist_branch_conversation_state(app_context, context=context, prompt=prompt, result=result)
+        return result
+
+    if saved_state is not None and saved_state.session_id:
+        result = await app_context.runner.run_codex_streaming_prompt(
+            prompt,
+            resume_session_id=saved_state.session_id,
+            on_update=on_update,
+        )
+        if result.result.ok:
+            _persist_branch_conversation_state(
+                app_context,
+                context=context,
+                prompt=prompt,
+                result=result,
+                session_id_override=result.session_id or saved_state.session_id,
+            )
+            return result
+
+        error_text = result.result.stderr or result.result.stdout or ""
+        if not _looks_like_resume_session_failure(error_text):
+            return result
+
+        logger.warning(
+            "Resume failed for %s [%s], falling back to a fresh session with saved summary.",
+            context.repo_path,
+            context.branch_label,
+        )
+
+    fresh_prompt = f"{context_prefix}{prompt}" if context_prefix else prompt
+    fresh_result = await app_context.runner.run_codex_streaming_prompt(
+        fresh_prompt,
+        image_paths=image_paths,
+        on_update=on_update,
+    )
+    _persist_branch_conversation_state(app_context, context=context, prompt=prompt, result=fresh_result)
+    return fresh_result
+
+
 async def _run_codex_chat_request(
     message: Message,
     app_context: AppContext,
@@ -1809,8 +2119,9 @@ async def _execute_codex_chat_stream(
 
     spinner_task = asyncio.create_task(spinner())
     try:
-        return await app_context.runner.run_codex_streaming_prompt(
-            prompt,
+        return await _run_branch_scoped_codex_prompt(
+            app_context=app_context,
+            prompt=prompt,
             image_paths=image_paths,
             on_update=on_update,
         )
@@ -1906,8 +2217,9 @@ async def _execute_codex_chat_stream_native(
     spinner_task = asyncio.create_task(spinner())
     keepalive_task = asyncio.create_task(keepalive())
     try:
-        return await app_context.runner.run_codex_streaming_prompt(
-            prompt,
+        return await _run_branch_scoped_codex_prompt(
+            app_context=app_context,
+            prompt=prompt,
             image_paths=image_paths,
             on_update=on_update,
         )
