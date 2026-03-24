@@ -1078,6 +1078,7 @@ class CodexRunner:
         last_payload = ""
         session_id = resume_session_id
         last_preview_text = ""
+        last_assistant_text = ""
 
         async def emit(payload: str, force: bool = False) -> None:
             nonlocal last_emit_at
@@ -1097,13 +1098,31 @@ class CodexRunner:
             last_payload = payload
 
         async def read_stderr() -> None:
+            nonlocal session_id
+            nonlocal last_preview_text
+            nonlocal last_assistant_text
             if process.stderr is None:
                 return
             while True:
                 line = await process.stderr.readline()
                 if not line:
                     break
-                stderr_lines.append(line.decode("utf-8", errors="replace"))
+                decoded_line = line.decode("utf-8", errors="replace")
+                stderr_lines.append(decoded_line)
+                current_stderr = "".join(stderr_lines)
+                maybe_session_id = _extract_resume_session_id(current_stderr)
+                if maybe_session_id:
+                    session_id = maybe_session_id
+                assistant_preview = _extract_resume_assistant_text(current_stderr)
+                if assistant_preview:
+                    last_assistant_text = assistant_preview
+                    last_preview_text = assistant_preview
+                    await emit(assistant_preview)
+                    continue
+                reasoning_preview = _extract_resume_reasoning_text(current_stderr)
+                if reasoning_preview:
+                    last_preview_text = reasoning_preview
+                    await emit(reasoning_preview)
 
         stderr_task = asyncio.create_task(read_stderr())
         timed_out = False
@@ -1119,13 +1138,11 @@ class CodexRunner:
                     decoded = stdout_decoder.decode(chunk, final=False)
                     stdout_parts.append(decoded)
                     current_stdout = "".join(stdout_parts)
-                    maybe_session_id = _extract_resume_session_id(current_stdout)
-                    if maybe_session_id:
-                        session_id = maybe_session_id
-                    preview = _extract_resume_assistant_text(current_stdout)
-                    if preview:
-                        last_preview_text = preview
-                        await emit(preview)
+                    stdout_preview = current_stdout.strip()
+                    if stdout_preview:
+                        last_assistant_text = stdout_preview
+                        last_preview_text = stdout_preview
+                        await emit(stdout_preview)
                 trailing = stdout_decoder.decode(b"", final=True)
                 if trailing:
                     stdout_parts.append(trailing)
@@ -1143,9 +1160,9 @@ class CodexRunner:
         exit_code = process.returncode if not timed_out else -1
         stdout = "".join(stdout_parts)
         stderr = "".join(stderr_lines)
-        final_text = _extract_resume_assistant_text(stdout).strip()
+        final_text = stdout.strip() or _extract_resume_assistant_text(stderr).strip()
         if not final_text:
-            final_text = last_preview_text.strip()
+            final_text = last_assistant_text.strip()
 
         if timed_out:
             stderr = (
@@ -1175,7 +1192,7 @@ class CodexRunner:
             result=result,
             final_text=final_text,
             session_id=session_id,
-            preview_text=last_preview_text.strip() or final_text,
+            preview_text=last_assistant_text.strip() or last_preview_text.strip() or final_text,
         )
 
     async def run_shell_command(self, args: list[str]) -> CommandResult:
@@ -1804,7 +1821,7 @@ def _extract_resume_assistant_text(stdout_text: str) -> str:
 
 
 def _parse_resume_transcript_sections(stdout_text: str) -> list[tuple[str, str]]:
-    header_pattern = re.compile(r"(?m)^(user|thinking|codex|tokens used)\s*$", flags=re.IGNORECASE)
+    header_pattern = re.compile(r"(?m)^(user|thinking|codex|exec|tokens used)\s*$", flags=re.IGNORECASE)
     matches = list(header_pattern.finditer(stdout_text))
     sections: list[tuple[str, str]] = []
     for index, match in enumerate(matches):
@@ -1839,3 +1856,16 @@ def _dedupe_trailing_duplicate_lines(value: str) -> str:
     if len(lines) >= 2 and lines[-1].strip() == lines[-2].strip():
         lines.pop()
     return "\n".join(lines).strip()
+
+
+def _extract_resume_reasoning_text(stdout_text: str) -> str:
+    if not stdout_text:
+        return ""
+    sections = _parse_resume_transcript_sections(stdout_text.replace("\r\n", "\n"))
+    for role, content in reversed(sections):
+        if role != "thinking":
+            continue
+        cleaned = _dedupe_trailing_duplicate_lines(content)
+        if cleaned and not _is_low_value_stream_text(cleaned):
+            return cleaned
+    return ""
