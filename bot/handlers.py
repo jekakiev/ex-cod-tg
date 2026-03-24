@@ -1099,6 +1099,58 @@ async def github_logout_callback(query: CallbackQuery, app_context: AppContext) 
         await query.answer(output, show_alert=True)
 
 
+@router.callback_query(F.data == "github:test")
+async def github_test_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    if query.message is None:
+        await query.answer("Unable to run the GitHub check.", show_alert=True)
+        return
+
+    await query.answer("Running GitHub access checks…")
+    async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
+        github_state = await _get_github_state(app_context, force=True)
+        api_result = await app_context.queue.submit(
+            f"github api user by {query.from_user.id if query.from_user else query.message.chat.id}",
+            app_context.runner.run_github_api_user,
+        )
+        push_result = await app_context.queue.submit(
+            f"github push dry-run by {query.from_user.id if query.from_user else query.message.chat.id}",
+            lambda: app_context.runner.run_git_command(
+                ["push", "--dry-run", "origin", "HEAD"],
+                timeout=app_context.config.git_timeout_seconds,
+                log_command=False,
+            ),
+        )
+
+    lines: list[str] = []
+    if github_state.logged_in:
+        lines.append(f"Status check: OK ({github_state.login or 'connected'})")
+    else:
+        lines.append("Status check: Failed")
+
+    if api_result.ok:
+        account_login = api_result.stdout.strip() or "unknown"
+        lines.append(f"API check: OK ({account_login})")
+    else:
+        api_error = (api_result.stderr or api_result.stdout or "unknown error").strip().splitlines()[0]
+        lines.append(f"API check: Failed ({api_error})")
+
+    if push_result.ok:
+        push_note = (push_result.stdout or "Everything up-to-date").strip().splitlines()[0]
+        lines.append(f"Push dry-run: OK ({push_note})")
+    else:
+        push_error = (push_result.stderr or push_result.stdout or "unknown error").strip().splitlines()[0]
+        lines.append(f"Push dry-run: Failed ({push_error})")
+
+    all_ok = github_state.logged_in and api_result.ok and push_result.ok
+    prefix = "✅ GitHub access looks good." if all_ok else "⚠️ GitHub access is not fully ready."
+    app_context.flash_message = f"{prefix}\n" + "\n".join(lines)
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    await _show_dashboard_from_callback(query, app_context, page="github")
+
+
 @router.callback_query(F.data == "whisper:noop")
 async def whisper_noop_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):

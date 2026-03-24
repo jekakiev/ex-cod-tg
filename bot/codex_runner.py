@@ -1364,6 +1364,14 @@ class CodexRunner:
             log_command=False,
         )
 
+    async def run_github_api_user(self) -> CommandResult:
+        return await self._run_process(
+            ["gh", "api", "user", "-q", ".login"],
+            cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+            timeout=30,
+            log_command=False,
+        )
+
     async def run_github_token_login(self, token: str) -> CommandResult:
         return await self._run_process(
             [

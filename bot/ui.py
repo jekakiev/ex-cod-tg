@@ -596,6 +596,7 @@ def github_keyboard(
             )
         else:
             rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh")])
+        rows.append([InlineKeyboardButton(text="🧪 Test access", callback_data="github:test")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)
