@@ -574,21 +574,28 @@ def github_keyboard(
                 InlineKeyboardButton(text="❌ Cancel login", callback_data="github:cancel_login"),
             ]
         )
-    elif auth_state.logged_in:
-        rows.append(
-            [
-                InlineKeyboardButton(text="🚪 Log out", callback_data="github:logout"),
-                InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh"),
-            ]
-        )
     else:
         rows.append(
             [
-                InlineKeyboardButton(text="🔐 Connect via browser", callback_data="github:login"),
-                InlineKeyboardButton(text="🔑 Use token", callback_data="github:token"),
+                InlineKeyboardButton(
+                    text="🔐 Reconnect via browser" if auth_state.logged_in else "🔐 Connect via browser",
+                    callback_data="github:login",
+                ),
+                InlineKeyboardButton(
+                    text="🔑 Use token instead" if auth_state.logged_in else "🔑 Use token",
+                    callback_data="github:token",
+                ),
             ]
         )
-        rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh")])
+        if auth_state.logged_in:
+            rows.append(
+                [
+                    InlineKeyboardButton(text="🚪 Log out", callback_data="github:logout"),
+                    InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh"),
+                ]
+            )
+        else:
+            rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)

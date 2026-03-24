@@ -441,6 +441,22 @@ class CodexRunner:
                 git_protocol = str(selected_entry.get("gitProtocol") or "").strip() or None
 
         if logged_in:
+            probe_result = await self._run_process(
+                ["gh", "api", "user", "-q", ".login"],
+                cwd=cwd,
+                timeout=20,
+                log_command=False,
+            )
+            if probe_result.ok:
+                live_login = probe_result.stdout.strip()
+                if live_login:
+                    login = live_login
+            else:
+                logged_in = False
+                probe_text = (probe_result.stderr or probe_result.stdout or "").strip()
+                raw_status = f"{raw_status}\n\nLive auth check failed:\n{probe_text}".strip()
+
+        if logged_in:
             status_summary = f"Connected as {login}" if login else "Connected"
         else:
             status_summary = "Not connected"
