@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import tempfile
 import time
@@ -27,6 +28,7 @@ from bot.codex_runner import (
     CodexModelInfo,
     CodexRunner,
     EnvironmentStatus,
+    GitHubAuthState,
     WhisperState,
     normalize_model_slug,
 )
@@ -52,12 +54,14 @@ from bot.ui import (
     admins_keyboard,
     build_admins_text,
     build_codex_text,
+    build_github_text,
     build_home_text,
     build_selected_models_text,
     build_settings_text,
     build_voice_preview_text,
     build_workspaces_root_text,
     codex_keyboard,
+    github_keyboard,
     home_keyboard,
     model_label,
     response_controls_keyboard,
@@ -110,7 +114,30 @@ class PendingWorkspacesRootRequest:
 
 
 @dataclass(slots=True)
+class PendingGitHubTokenRequest:
+    requester_id: int
+    requester_chat_id: int
+
+
+@dataclass(slots=True)
 class CodexLoginSession:
+    owner_user_id: int
+    owner_chat_id: int
+    process: asyncio.subprocess.Process
+    output_lines: list[str] = field(default_factory=list)
+    completed: bool = False
+    returncode: int | None = None
+    monitor_task: asyncio.Task[None] | None = None
+
+    def render_output(self) -> str | None:
+        text = "".join(self.output_lines).strip()
+        if not text:
+            return None
+        return text[-2500:]
+
+
+@dataclass(slots=True)
+class GitHubLoginSession:
     owner_user_id: int
     owner_chat_id: int
     process: asyncio.subprocess.Process
@@ -203,11 +230,14 @@ class AppContext:
     dashboards: dict[int, DashboardSession] = field(default_factory=dict)
     pending_admin_request: PendingAdminRequest | None = None
     pending_workspaces_root_request: PendingWorkspacesRootRequest | None = None
+    pending_github_token_request: PendingGitHubTokenRequest | None = None
     pending_reset_request: PendingResetRequest | None = None
     pending_voice_requests: dict[str, PendingVoiceRequest] = field(default_factory=dict)
     pending_image_requests: dict[int, PendingImageRequest] = field(default_factory=dict)
     codex_login_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     codex_login_session: CodexLoginSession | None = None
+    github_login_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    github_login_session: GitHubLoginSession | None = None
     flash_message: str | None = None
     cached_update_state: BotUpdateState | None = None
     update_checked_at: float = 0.0
@@ -215,6 +245,8 @@ class AppContext:
     environment_checked_at: float = 0.0
     cached_auth_state: CodexAuthState | None = None
     auth_checked_at: float = 0.0
+    cached_github_state: GitHubAuthState | None = None
+    github_checked_at: float = 0.0
     cached_whisper_state: WhisperState | None = None
     whisper_checked_at: float = 0.0
     cached_model_catalog: list[CodexModelInfo] | None = None
@@ -464,6 +496,16 @@ async def navigation_callback(query: CallbackQuery, app_context: AppContext) -> 
             page="home",
         )
         return
+    pending_github_token = app_context.pending_github_token_request
+    if (
+        pending_github_token is not None
+        and query.from_user is not None
+        and query.message is not None
+        and pending_github_token.requester_id == query.from_user.id
+        and pending_github_token.requester_chat_id == query.message.chat.id
+        and page != "github"
+    ):
+        app_context.pending_github_token_request = None
     if page in {"model", "models", "thinking"}:
         page = "home"
     elif page == "whisper":
@@ -923,6 +965,140 @@ async def codex_logout_callback(query: CallbackQuery, app_context: AppContext) -
         await query.answer(output, show_alert=True)
 
 
+@router.callback_query(F.data == "github:refresh")
+async def github_refresh_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    await query.answer("Refreshed.")
+
+
+@router.callback_query(F.data == "github:login")
+async def github_login_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    if query.from_user is None or query.message is None:
+        await query.answer("Unable to start GitHub login.", show_alert=True)
+        return
+
+    async with app_context.github_login_lock:
+        existing = app_context.github_login_session
+        if existing and not existing.completed:
+            await query.answer("Login already in progress.", show_alert=True)
+            return
+
+        gh_path = app_context.runner.gh_path()
+        if gh_path is None:
+            await query.answer("GitHub CLI not found on PATH.", show_alert=True)
+            return
+
+        env = os.environ.copy()
+        env["BROWSER"] = "true"
+        env["GH_PROMPT_DISABLED"] = "1"
+        process = await asyncio.create_subprocess_exec(
+            "gh",
+            "auth",
+            "login",
+            "--hostname",
+            "github.com",
+            "--git-protocol",
+            "https",
+            "--skip-ssh-key",
+            "--web",
+            "--clipboard",
+            cwd=str(app_context.config.working_dir if app_context.config.working_dir_exists else Path.home()),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        session = GitHubLoginSession(
+            owner_user_id=query.from_user.id,
+            owner_chat_id=query.message.chat.id,
+            process=process,
+        )
+        session.monitor_task = asyncio.create_task(
+            _monitor_github_login_session(app_context, query.bot, session)
+        )
+        app_context.github_login_session = session
+        app_context.pending_github_token_request = None
+
+    await asyncio.sleep(1)
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    await query.answer("Login flow started.")
+
+
+@router.callback_query(F.data == "github:cancel_login")
+async def github_cancel_login_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+
+    session = app_context.github_login_session
+    if session is None or session.completed:
+        await query.answer("No active login flow.", show_alert=True)
+        await _show_dashboard_from_callback(query, app_context, page="github")
+        return
+
+    session.process.kill()
+    with suppress(ProcessLookupError):
+        await session.process.wait()
+    session.completed = True
+    session.returncode = session.process.returncode
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    await query.answer("Login flow cancelled.")
+
+
+@router.callback_query(F.data == "github:token")
+async def github_token_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    if query.from_user is None or query.message is None:
+        await query.answer("Unable to start token login.", show_alert=True)
+        return
+
+    app_context.pending_github_token_request = PendingGitHubTokenRequest(
+        requester_id=query.from_user.id,
+        requester_chat_id=query.message.chat.id,
+    )
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    await query.answer("Send the token in the next message.")
+
+
+@router.callback_query(F.data == "github:cancel_token")
+async def github_cancel_token_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    app_context.pending_github_token_request = None
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    await query.answer("Token login cancelled.")
+
+
+@router.callback_query(F.data == "github:logout")
+async def github_logout_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    if query.message is None:
+        await query.answer("Unable to log out.", show_alert=True)
+        return
+
+    github_state = await _get_github_state(app_context)
+    async with ChatActionSender.typing(bot=query.bot, chat_id=query.message.chat.id):
+        result = await app_context.runner.run_github_logout(github_state.login)
+
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    await _show_dashboard_from_callback(query, app_context, page="github")
+    if result.ok:
+        await query.answer("Logged out.")
+    else:
+        output = (result.stderr or result.stdout or "Logout failed.")[:180]
+        await query.answer(output, show_alert=True)
+
+
 @router.callback_query(F.data == "whisper:noop")
 async def whisper_noop_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
@@ -1112,6 +1288,9 @@ async def generic_message_handler(message: Message, app_context: AppContext) -> 
 
     await _sync_admin_label_from_message(message, app_context)
 
+    if await _handle_pending_github_token_message(message, app_context):
+        return
+
     if await _handle_pending_workspaces_root_message(message, app_context):
         return
 
@@ -1291,6 +1470,21 @@ async def _get_auth_state(app_context: AppContext, *, force: bool = False) -> Co
     app_context.cached_auth_state = auth_state
     app_context.auth_checked_at = now
     return auth_state
+
+
+async def _get_github_state(app_context: AppContext, *, force: bool = False) -> GitHubAuthState:
+    now = time.monotonic()
+    if (
+        not force
+        and app_context.cached_github_state is not None
+        and now - app_context.github_checked_at < STATUS_CACHE_TTL_SECONDS
+    ):
+        return app_context.cached_github_state
+
+    github_state = await app_context.runner.collect_github_auth_state()
+    app_context.cached_github_state = github_state
+    app_context.github_checked_at = now
+    return github_state
 
 
 def _home_codex_notice(auth_state: CodexAuthState) -> str | None:
@@ -1559,6 +1753,51 @@ async def _handle_pending_workspaces_root_message(message: Message, app_context:
     app_context.pending_workspaces_root_request = None
     app_context.flash_message = f"✅ Workspaces root updated to {candidate}"
     await _show_dashboard_from_message(message, app_context, page="home")
+    return True
+
+
+async def _handle_pending_github_token_message(message: Message, app_context: AppContext) -> bool:
+    pending = app_context.pending_github_token_request
+    if pending is None or message.from_user is None:
+        return False
+    if pending.requester_id != message.from_user.id or pending.requester_chat_id != message.chat.id:
+        return False
+
+    token = (message.text or "").strip()
+    if not token or token.startswith("/"):
+        await message.answer("Send the GitHub token as plain text, or tap Cancel in Settings -> GitHub.")
+        return True
+
+    app_context.pending_github_token_request = None
+    with suppress(Exception):
+        await message.delete()
+
+    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+        login_result = await app_context.queue.submit(
+            f"github token login by {message.from_user.id}",
+            lambda: app_context.runner.run_github_token_login(token),
+        )
+        setup_result = None
+        if login_result.ok:
+            setup_result = await app_context.queue.submit(
+                f"github setup-git by {message.from_user.id}",
+                app_context.runner.run_github_setup_git,
+            )
+
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    github_state = await _get_github_state(app_context, force=True)
+
+    if login_result.ok and github_state.logged_in:
+        if setup_result is None or setup_result.ok:
+            app_context.flash_message = "✅ GitHub connected."
+        else:
+            app_context.flash_message = "✅ GitHub connected, but git credential helper setup failed."
+    else:
+        error_text = (login_result.stderr or login_result.stdout or "GitHub login failed.")[:600]
+        app_context.flash_message = f"❌ {error_text}"
+
+    await _show_dashboard_from_message(message, app_context, page="github")
     return True
 
 
@@ -2643,6 +2882,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
 
     if page == "settings":
         auth_state = await _get_auth_state(app_context)
+        github_state = await _get_github_state(app_context)
         whisper_state = await _get_whisper_state(app_context)
         update_state = await _get_bot_update_state(app_context)
         update_progress = app_context.update_progress
@@ -2653,6 +2893,7 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         return (
             build_settings_text(
                 auth_state=auth_state,
+                github_state=github_state,
                 whisper_state=whisper_state,
                 update_state=update_state,
                 workspaces_root=app_context.config.workspaces_root,
@@ -2665,6 +2906,29 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 whisper_busy=whisper_busy,
                 update_busy=bool(update_progress and update_progress.in_progress),
                 update_confirm_pending=bool(update_progress and update_progress.awaiting_confirmation),
+            ),
+        )
+
+    if page == "github":
+        github_state = await _get_github_state(app_context)
+        session = app_context.github_login_session
+        device_auth = _extract_device_auth_view(session.render_output() if session else None)
+        login_active = bool(session and not session.completed)
+        waiting_for_token = app_context.pending_github_token_request is not None
+        flash_message = app_context.flash_message
+        app_context.flash_message = None
+        return (
+            build_github_text(
+                auth_state=github_state,
+                device_auth=device_auth,
+                login_active=login_active,
+                waiting_for_token=waiting_for_token,
+                flash_message=flash_message,
+            ),
+            github_keyboard(
+                auth_state=github_state,
+                login_active=login_active,
+                waiting_for_token=waiting_for_token,
             ),
         )
 
@@ -2784,6 +3048,49 @@ async def _monitor_codex_login_session(
                 user_id=session.owner_user_id,
                 page="codex",
             )
+
+
+async def _monitor_github_login_session(
+    app_context: AppContext,
+    bot: Bot,
+    session: GitHubLoginSession,
+) -> None:
+    if session.process.stdout is None:
+        session.completed = True
+        return
+
+    setup_result = None
+    initial_github_state = await app_context.runner.collect_github_auth_state()
+    try:
+        while True:
+            line = await session.process.stdout.readline()
+            if not line:
+                break
+            session.output_lines.append(line.decode("utf-8", errors="replace"))
+            if sum(len(item) for item in session.output_lines) > 5000:
+                joined = "".join(session.output_lines)[-4000:]
+                session.output_lines = [joined]
+        await session.process.wait()
+        session.returncode = session.process.returncode
+        if session.returncode == 0:
+            setup_result = await app_context.runner.run_github_setup_git()
+    finally:
+        session.completed = True
+        final_github_state = await app_context.runner.collect_github_auth_state()
+        app_context.cached_github_state = final_github_state
+        app_context.github_checked_at = time.monotonic()
+        if not initial_github_state.logged_in and final_github_state.logged_in:
+            if setup_result is None or setup_result.ok:
+                app_context.flash_message = "✅ GitHub connected."
+            else:
+                app_context.flash_message = "✅ GitHub connected, but git credential helper setup failed."
+        await _refresh_dashboard_for_chat(
+            bot=bot,
+            app_context=app_context,
+            chat_id=session.owner_chat_id,
+            user_id=session.owner_user_id,
+            page="github",
+        )
 
 
 def _refresh_admin_ids(app_context: AppContext, admin_ids: list[int]) -> None:

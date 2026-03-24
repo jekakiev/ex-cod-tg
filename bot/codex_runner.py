@@ -111,6 +111,20 @@ class CodexAuthState:
 
 
 @dataclass(slots=True)
+class GitHubAuthState:
+    cli_path: str | None
+    cli_version: str | None
+    logged_in: bool
+    host: str
+    login: str | None
+    token_source: str | None
+    scopes: str | None
+    git_protocol: str | None
+    status_summary: str
+    raw_status: str
+
+
+@dataclass(slots=True)
 class CodexStreamResult:
     result: CommandResult
     final_text: str
@@ -258,6 +272,9 @@ class CodexRunner:
     def codex_path(self) -> str | None:
         return shutil.which(self.config.codex_bin)
 
+    def gh_path(self) -> str | None:
+        return shutil.which("gh")
+
     def codex_auth_file(self) -> Path:
         return Path.home() / ".codex" / "auth.json"
 
@@ -353,6 +370,92 @@ class CodexRunner:
             account_email=account_email,
             status_summary=status_summary,
             raw_status=raw_status,
+        )
+
+    async def collect_github_auth_state(self) -> GitHubAuthState:
+        cli_path = self.gh_path()
+        cli_version = None
+        cwd = self.config.working_dir if self.config.working_dir_exists else Path.home()
+        if cli_path is not None:
+            version_result = await self._run_process(
+                ["gh", "--version"],
+                cwd=cwd,
+                timeout=15,
+                log_command=False,
+            )
+            if version_result.ok:
+                cli_version = (version_result.stdout.splitlines() or [""])[0].strip() or None
+
+        if cli_path is None:
+            return GitHubAuthState(
+                cli_path=None,
+                cli_version=None,
+                logged_in=False,
+                host="github.com",
+                login=None,
+                token_source=None,
+                scopes=None,
+                git_protocol=None,
+                status_summary="CLI not found",
+                raw_status="GitHub CLI was not found on PATH.",
+            )
+
+        status_result = await self._run_process(
+            ["gh", "auth", "status", "--json", "hosts"],
+            cwd=cwd,
+            timeout=15,
+            log_command=False,
+        )
+        raw_status = (status_result.stdout or status_result.stderr).strip()
+        login = None
+        token_source = None
+        scopes = None
+        git_protocol = None
+        logged_in = False
+
+        try:
+            payload = json.loads(status_result.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        hosts = payload.get("hosts") if isinstance(payload, dict) else None
+        entries = hosts.get("github.com") if isinstance(hosts, dict) else None
+        if isinstance(entries, list) and entries:
+            selected_entry = next(
+                (
+                    item
+                    for item in entries
+                    if isinstance(item, dict) and item.get("active") and item.get("state") == "success"
+                ),
+                None,
+            )
+            if selected_entry is None:
+                selected_entry = next(
+                    (item for item in entries if isinstance(item, dict) and item.get("state") == "success"),
+                    None,
+                )
+            if isinstance(selected_entry, dict):
+                logged_in = selected_entry.get("state") == "success"
+                login = str(selected_entry.get("login") or "").strip() or None
+                token_source = str(selected_entry.get("tokenSource") or "").strip() or None
+                scopes = str(selected_entry.get("scopes") or "").strip() or None
+                git_protocol = str(selected_entry.get("gitProtocol") or "").strip() or None
+
+        if logged_in:
+            status_summary = f"Connected as {login}" if login else "Connected"
+        else:
+            status_summary = "Not connected"
+
+        return GitHubAuthState(
+            cli_path=cli_path,
+            cli_version=cli_version,
+            logged_in=logged_in,
+            host="github.com",
+            login=login,
+            token_source=token_source,
+            scopes=scopes,
+            git_protocol=git_protocol,
+            status_summary=status_summary,
+            raw_status=raw_status or "You are not logged into any GitHub hosts.",
         )
 
     async def collect_bot_update_state(self) -> BotUpdateState:
@@ -1237,6 +1340,44 @@ class CodexRunner:
             timeout=60,
         )
 
+    async def run_github_setup_git(self) -> CommandResult:
+        return await self._run_process(
+            ["gh", "auth", "setup-git", "--hostname", "github.com"],
+            cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+            timeout=30,
+            log_command=False,
+        )
+
+    async def run_github_token_login(self, token: str) -> CommandResult:
+        return await self._run_process(
+            [
+                "gh",
+                "auth",
+                "login",
+                "--hostname",
+                "github.com",
+                "--git-protocol",
+                "https",
+                "--skip-ssh-key",
+                "--with-token",
+            ],
+            cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+            timeout=120,
+            log_command=False,
+            stdin_text=f"{token.rstrip()}\n",
+        )
+
+    async def run_github_logout(self, login: str | None = None) -> CommandResult:
+        args = ["gh", "auth", "logout", "--hostname", "github.com"]
+        if login:
+            args.extend(["--user", login])
+        return await self._run_process(
+            args,
+            cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
+            timeout=60,
+            log_command=False,
+        )
+
     async def _run_process(
         self,
         args: list[str],
@@ -1244,6 +1385,7 @@ class CodexRunner:
         cwd: Path,
         timeout: int,
         log_command: bool = True,
+        stdin_text: str | None = None,
     ) -> CommandResult:
         started_at = time.perf_counter()
         command_display = shlex.join(args)
@@ -1255,6 +1397,7 @@ class CodexRunner:
             process = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=str(cwd),
+                stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1267,7 +1410,8 @@ class CodexRunner:
 
         timed_out = False
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(stdin_bytes), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
             process.kill()

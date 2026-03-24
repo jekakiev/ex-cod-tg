@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.codex_runner import BotUpdateState, CodexAuthState, EnvironmentStatus, WhisperState, normalize_model_slug
+from bot.codex_runner import BotUpdateState, CodexAuthState, EnvironmentStatus, GitHubAuthState, WhisperState, normalize_model_slug
 from bot.version import APP_VERSION
 
 
@@ -199,6 +199,7 @@ def home_keyboard(
 def build_settings_text(
     *,
     auth_state: CodexAuthState,
+    github_state: GitHubAuthState,
     whisper_state: WhisperState,
     update_state: BotUpdateState,
     workspaces_root: Path,
@@ -208,9 +209,10 @@ def build_settings_text(
 ) -> str:
     text = (
         "<b>Settings</b>\n\n"
-        "Manage admin access, Codex CLI authorization, Whisper, bot updates, and the workspaces root.\n\n"
+        "Manage admin access, Codex CLI authorization, GitHub, Whisper, bot updates, and the workspaces root.\n\n"
         f"Workspaces root: <code>{html.escape(str(workspaces_root))}</code>\n"
         f"Codex auth: <code>{html.escape(auth_state.account_summary or auth_state.status_summary)}</code>\n"
+        f"GitHub: <code>{html.escape(github_state.status_summary)}</code>\n"
         f"Whisper: <code>{html.escape(whisper_state.summary)}</code>\n"
         f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>"
     )
@@ -255,7 +257,10 @@ def settings_keyboard(
             InlineKeyboardButton(text="Codex CLI", callback_data="nav:codex"),
         ],
         [
+            InlineKeyboardButton(text="GitHub", callback_data="nav:github"),
             InlineKeyboardButton(text="Selected models", callback_data="nav:selected_models"),
+        ],
+        [
             InlineKeyboardButton(
                 text=(
                     "⏳ Whisper…"
@@ -272,14 +277,10 @@ def settings_keyboard(
                     else "whisper:install"
                 ),
             ),
+            InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
         ],
     ]
-    rows.append(
-        [
-            InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run"),
-            InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
-        ]
-    )
+    rows.append([InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run")])
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")])
     return _keyboard(rows)
 
@@ -486,6 +487,108 @@ def codex_keyboard(*, auth_state: CodexAuthState, login_active: bool) -> InlineK
     else:
         rows.append([InlineKeyboardButton(text="🔐 Log in", callback_data="codex:login")])
         rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="codex:refresh")])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
+    return _keyboard(rows)
+
+
+def build_github_text(
+    *,
+    auth_state: GitHubAuthState,
+    device_auth: DeviceAuthView | None,
+    login_active: bool,
+    waiting_for_token: bool,
+    flash_message: str | None = None,
+) -> str:
+    lines = [
+        "<b>GitHub</b>",
+        "",
+        f"CLI: <code>{html.escape(auth_state.cli_version or 'missing')}</code>",
+        f"Status: <code>{html.escape(auth_state.status_summary)}</code>",
+    ]
+
+    if auth_state.login:
+        lines.append(f"Account: <code>{html.escape(auth_state.login)}</code>")
+    if auth_state.git_protocol:
+        lines.append(f"Git protocol: <code>{html.escape(auth_state.git_protocol)}</code>")
+    if auth_state.token_source:
+        lines.append(f"Token source: <code>{html.escape(auth_state.token_source)}</code>")
+    if auth_state.scopes:
+        lines.append(f"Scopes: <code>{html.escape(auth_state.scopes)}</code>")
+
+    if waiting_for_token:
+        lines.extend(
+            [
+                "",
+                "<b>Token login</b>",
+                "Send your GitHub token in the next message.",
+                "Required scopes: <code>repo, read:org, gist</code>",
+                "Your token message will be deleted after it is used.",
+            ]
+        )
+    elif login_active:
+        lines.extend(
+            [
+                "",
+                "<b>Authorization in progress</b>",
+                "1. Copy this code:",
+            ]
+        )
+        if device_auth and device_auth.user_code:
+            lines.append(f"<pre><code>{html.escape(device_auth.user_code)}</code></pre>")
+        lines.extend(
+            [
+                "2. Open this link and finish the GitHub login:",
+            ]
+        )
+    elif device_auth and device_auth.raw_text:
+        lines.extend(["", "<b>Last login flow</b>"])
+
+    if device_auth and device_auth.verification_url:
+        lines.append(f'<a href="{html.escape(device_auth.verification_url)}">{html.escape(device_auth.verification_url)}</a>')
+
+    if device_auth and device_auth.raw_text and not (device_auth.verification_url or device_auth.user_code):
+        lines.append("")
+        lines.append("<b>Details</b>")
+        lines.append(f"<pre><code>{html.escape(device_auth.raw_text)}</code></pre>")
+
+    text = "\n".join(lines)
+    if flash_message:
+        text = f"{text}\n\n<blockquote>{html.escape(flash_message)}</blockquote>"
+    return text
+
+
+def github_keyboard(
+    *,
+    auth_state: GitHubAuthState,
+    login_active: bool,
+    waiting_for_token: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if waiting_for_token:
+        rows.append([InlineKeyboardButton(text="❌ Cancel token", callback_data="github:cancel_token")])
+    elif login_active:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh"),
+                InlineKeyboardButton(text="❌ Cancel login", callback_data="github:cancel_login"),
+            ]
+        )
+    elif auth_state.logged_in:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🚪 Log out", callback_data="github:logout"),
+                InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh"),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🔐 Connect via browser", callback_data="github:login"),
+                InlineKeyboardButton(text="🔑 Use token", callback_data="github:token"),
+            ]
+        )
+        rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="github:refresh")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")])
     return _keyboard(rows)
