@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
@@ -81,6 +81,9 @@ router = Router(name=__name__)
 UPDATE_CHECK_TTL_SECONDS = 120
 STATUS_CACHE_TTL_SECONDS = 5
 MODEL_CATALOG_CACHE_TTL_SECONDS = 60
+STREAM_UPDATE_INTERVAL_SECONDS = 0.25
+STREAM_KEEPALIVE_INTERVAL_SECONDS = 1.2
+STREAM_DRAFT_RETRY_GRACE_SECONDS = 0.2
 
 
 @dataclass(slots=True)
@@ -1773,7 +1776,8 @@ def _persist_branch_conversation_state(
         return
 
     session_id = session_id_override if session_id_override is not None else result.session_id
-    summary = _build_conversation_summary(prompt=prompt, final_text=result.final_text)
+    summary_text = result.final_text.strip() or result.preview_text.strip()
+    summary = _build_conversation_summary(prompt=prompt, final_text=summary_text)
     app_context.conversation_store.set(
         repo_path=context.repo_path,
         branch_name=context.branch_name,
@@ -1897,11 +1901,12 @@ async def _run_codex_chat_request(
         )
 
     if result.result.ok:
-        if result.final_text.strip():
+        final_body = result.final_text.strip() or result.preview_text.strip()
+        if final_body:
             await _edit_streaming_message(
                 reply,
                 _render_streaming_message(
-                    body=result.final_text,
+                    body=final_body,
                     finished=True,
                 ),
                 reply_markup=response_controls_keyboard(
@@ -1964,7 +1969,7 @@ async def _run_codex_chat_request_native(
         current_thinking_level=current_thinking_level,
     )
     if result.result.ok:
-        final_body = result.final_text.strip() or "Completed with no assistant text."
+        final_body = result.final_text.strip() or result.preview_text.strip() or "Completed with no assistant text."
         await message.reply(
             _render_final_stream_message(body=final_body),
             reply_markup=markup,
@@ -2055,12 +2060,29 @@ async def _execute_codex_chat_stream(
     app_context: AppContext,
     image_paths: list[Path],
 ) -> Any:
-    last_edit_at = 0.0
-    last_rendered_text = ""
-    preview_seen = False
+    last_preview_emit_at = 0.0
+    last_preview_text = ""
+    heartbeat_tick = 0
     spinner_stop = asyncio.Event()
+    render_lock = asyncio.Lock()
+
+    async def render_preview(body: str, *, heartbeat: int = 0) -> None:
+        in_progress_body = _append_stream_keepalive_footer(body, heartbeat_tick=heartbeat)
+        async with render_lock:
+            await _edit_streaming_message(
+                reply,
+                _render_streaming_message(
+                    body=in_progress_body,
+                    finished=False,
+                ),
+                reply_markup=response_controls_keyboard(
+                    current_model=app_context.config.codex_model,
+                    current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
+                ),
+            )
 
     async def spinner() -> None:
+        nonlocal heartbeat_tick
         started_at = time.monotonic()
         frame_index = 0
         frames = (
@@ -2072,50 +2094,34 @@ async def _execute_codex_chat_stream(
             "Preparing reply",
         )
         while not spinner_stop.is_set():
-            await asyncio.sleep(1.2)
-            if spinner_stop.is_set() or preview_seen:
+            await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL_SECONDS)
+            if spinner_stop.is_set():
+                return
+            if last_preview_text:
+                heartbeat_tick += 1
+                await render_preview(last_preview_text, heartbeat=heartbeat_tick)
                 continue
             elapsed = int(time.monotonic() - started_at)
             frame = frames[frame_index % len(frames)]
             frame_index += 1
-            await _edit_streaming_message(
-                reply,
-                _render_streaming_message(
-                    body=f"{frame} {elapsed}s",
-                    finished=False,
-                ),
-                reply_markup=response_controls_keyboard(
-                    current_model=app_context.config.codex_model,
-                    current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
-                ),
-            )
+            await render_preview(f"{frame} {elapsed}s")
 
     async def on_update(text: str) -> None:
-        nonlocal last_edit_at
-        nonlocal last_rendered_text
-        nonlocal preview_seen
+        nonlocal last_preview_emit_at
+        nonlocal last_preview_text
+        nonlocal heartbeat_tick
         now = time.monotonic()
         text = text.strip()
         if not text:
             return
-        preview_seen = True
-        if text == last_rendered_text:
+        if text == last_preview_text and now - last_preview_emit_at < STREAM_UPDATE_INTERVAL_SECONDS:
             return
-        if now - last_edit_at < 0.03:
+        if now - last_preview_emit_at < STREAM_UPDATE_INTERVAL_SECONDS:
             return
-        await _edit_streaming_message(
-            reply,
-            _render_streaming_message(
-                body=text,
-                finished=False,
-            ),
-            reply_markup=response_controls_keyboard(
-                current_model=app_context.config.codex_model,
-                current_thinking_level=_effective_thinking_level(app_context, app_context.config.codex_model),
-            ),
-        )
-        last_edit_at = now
-        last_rendered_text = text
+        last_preview_text = text
+        heartbeat_tick = 0
+        await render_preview(text)
+        last_preview_emit_at = now
 
     spinner_task = asyncio.create_task(spinner())
     try:
@@ -2140,43 +2146,38 @@ async def _execute_codex_chat_stream_native(
     app_context: AppContext,
     image_paths: list[Path],
 ) -> Any:
-    last_edit_at = 0.0
-    last_rendered_text = ""
-    preview_seen = False
+    last_preview_emit_at = 0.0
+    last_preview_text = ""
     spinner_stop = asyncio.Event()
-    current_draft_text = ""
     keepalive_tick = 0
-    last_draft_sent_at = 0.0
+    blocked_until = 0.0
+    draft_lock = asyncio.Lock()
 
-    async def update_draft(text: str, *, keepalive: bool = False) -> None:
-        nonlocal current_draft_text
-        nonlocal keepalive_tick
-        nonlocal last_draft_sent_at
-        current_draft_text = text
-        if keepalive:
-            keepalive_tick += 1
+    async def update_draft(text: str, *, heartbeat: int = 0) -> None:
+        nonlocal blocked_until
+        now = time.monotonic()
+        if now < blocked_until:
+            return
+        rendered_text = _render_draft_stream_message(text, heartbeat_tick=heartbeat)
         try:
-            await message.bot.send_message_draft(
-                chat_id=message.chat.id,
-                draft_id=draft_id,
-                text=_render_draft_stream_message(text, heartbeat_tick=keepalive_tick if keepalive else 0),
+            async with draft_lock:
+                await message.bot.send_message_draft(
+                    chat_id=message.chat.id,
+                    draft_id=draft_id,
+                    text=rendered_text,
+                )
+        except TelegramRetryAfter as exc:
+            blocked_until = time.monotonic() + float(exc.retry_after) + STREAM_DRAFT_RETRY_GRACE_SECONDS
+            logger.warning(
+                "Telegram draft update throttled in chat %s. Backing off for %.1fs.",
+                message.chat.id,
+                float(exc.retry_after),
             )
-            last_draft_sent_at = time.monotonic()
         except Exception:
             logger.exception("Failed to send Telegram draft update")
 
-    async def keepalive() -> None:
-        while not spinner_stop.is_set():
-            await asyncio.sleep(1.4)
-            if spinner_stop.is_set():
-                return
-            if not current_draft_text:
-                continue
-            if time.monotonic() - last_draft_sent_at < 1.1:
-                continue
-            await update_draft(current_draft_text, keepalive=True)
-
     async def spinner() -> None:
+        nonlocal keepalive_tick
         started_at = time.monotonic()
         frame_index = 0
         frames = (
@@ -2188,8 +2189,12 @@ async def _execute_codex_chat_stream_native(
             "Preparing reply",
         )
         while not spinner_stop.is_set():
-            await asyncio.sleep(1.2)
-            if spinner_stop.is_set() or preview_seen:
+            await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL_SECONDS)
+            if spinner_stop.is_set():
+                return
+            if last_preview_text:
+                keepalive_tick += 1
+                await update_draft(last_preview_text, heartbeat=keepalive_tick)
                 continue
             elapsed = int(time.monotonic() - started_at)
             frame = frames[frame_index % len(frames)]
@@ -2197,25 +2202,24 @@ async def _execute_codex_chat_stream_native(
             await update_draft(f"{frame} {elapsed}s")
 
     async def on_update(text: str) -> None:
-        nonlocal last_edit_at
-        nonlocal last_rendered_text
-        nonlocal preview_seen
+        nonlocal last_preview_emit_at
+        nonlocal last_preview_text
+        nonlocal keepalive_tick
         now = time.monotonic()
         text = text.strip()
         if not text:
             return
-        preview_seen = True
-        if text == last_rendered_text:
+        if text == last_preview_text and now - last_preview_emit_at < STREAM_UPDATE_INTERVAL_SECONDS:
             return
-        if now - last_edit_at < 0.03:
+        if now - last_preview_emit_at < STREAM_UPDATE_INTERVAL_SECONDS:
             return
+        last_preview_text = text
+        keepalive_tick = 0
         await update_draft(text)
-        last_edit_at = now
-        last_rendered_text = text
+        last_preview_emit_at = now
 
     await update_draft("Thinking…")
     spinner_task = asyncio.create_task(spinner())
-    keepalive_task = asyncio.create_task(keepalive())
     try:
         return await _run_branch_scoped_codex_prompt(
             app_context=app_context,
@@ -2226,11 +2230,8 @@ async def _execute_codex_chat_stream_native(
     finally:
         spinner_stop.set()
         spinner_task.cancel()
-        keepalive_task.cancel()
         with suppress(asyncio.CancelledError):
             await spinner_task
-        with suppress(asyncio.CancelledError):
-            await keepalive_task
 
 
 async def _handle_image_message(message: Message, app_context: AppContext) -> bool:
@@ -3194,9 +3195,7 @@ def _render_streaming_message(
 
 def _render_draft_stream_message(body: str, *, heartbeat_tick: int = 0) -> str:
     rendered = _clip_stream_text(body, limit=3800)
-    if heartbeat_tick % 2:
-        return f"{rendered}\u2060"
-    return rendered
+    return _append_stream_keepalive_footer(rendered, heartbeat_tick=heartbeat_tick)
 
 
 def _render_final_stream_message(*, body: str, failed: bool = False) -> str:
@@ -3233,6 +3232,17 @@ def _clip_stream_text(value: str, *, limit: int = 3000) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[-limit:]}\n\n[truncated]"
+
+
+def _append_stream_keepalive_footer(value: str, *, heartbeat_tick: int) -> str:
+    if heartbeat_tick <= 0:
+        return value
+    return f"{value}\n\n{_stream_keepalive_label(heartbeat_tick)}"
+
+
+def _stream_keepalive_label(heartbeat_tick: int) -> str:
+    frames = ("Working.", "Working..", "Working...")
+    return frames[(heartbeat_tick - 1) % len(frames)]
 
 
 def _extract_device_auth_view(raw_output: str | None) -> DeviceAuthView | None:

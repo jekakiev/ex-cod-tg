@@ -63,7 +63,7 @@ On macOS, the install also adds a menu bar helper so you can see bot status, ope
 
 ### Main screen
 
-- see the active repo, latest commit, diff summary, and bot update status
+- see the active repo, latest commit, and diff summary
 - switch repositories with `prev / next` or jump through `All repos`
 - switch branches with `prev / next` or jump through `All branches`
 - tap `Model` and `Thinking` to cycle the current Codex defaults instantly

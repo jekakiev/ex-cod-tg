@@ -72,7 +72,6 @@ def build_home_text(
         diff_line = f"{environment.changed_files_count} file(s)"
     lines = [
         f"<b>ex-cod {APP_VERSION}</b>\n\n"
-        f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>\n\n"
         f"Project: <code>{html.escape(active_project_name)}</code>\n"
         f"Latest commit: <code>{html.escape(latest_commit_line)}</code>\n"
         f"Diff: <code>{html.escape(diff_line)}</code>"

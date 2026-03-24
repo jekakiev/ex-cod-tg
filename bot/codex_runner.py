@@ -38,6 +38,7 @@ MODEL_ALIAS_MAP = {
 }
 DEFAULT_SELECTED_MODELS = ("gpt-5.4", "gpt-5.4-mini")
 DEFAULT_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
+STREAM_EMIT_INTERVAL_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -114,6 +115,7 @@ class CodexStreamResult:
     result: CommandResult
     final_text: str
     session_id: str | None = None
+    preview_text: str = ""
 
 
 @dataclass(slots=True)
@@ -908,7 +910,7 @@ class CodexRunner:
             if payload == last_payload:
                 return
             now = time.monotonic()
-            if not force and now - last_emit_at < 0.03:
+            if not force and now - last_emit_at < STREAM_EMIT_INTERVAL_SECONDS:
                 return
             await on_update(payload)
             last_emit_at = now
@@ -993,6 +995,7 @@ class CodexRunner:
 
         if not final_text:
             final_text = stream_state.assistant_text.strip() or stream_state.preview_text
+        preview_text = stream_state.assistant_text.strip() or stream_state.preview_text.strip()
 
         if session_id is None and not resume_session_id:
             session_id = await asyncio.to_thread(self._recover_recent_session_id, started_at_epoch)
@@ -1023,7 +1026,12 @@ class CodexRunner:
             timed_out=timed_out,
         )
         await emit(stream_state.preview_text, force=True)
-        return CodexStreamResult(result=result, final_text=final_text, session_id=session_id)
+        return CodexStreamResult(
+            result=result,
+            final_text=final_text,
+            session_id=session_id,
+            preview_text=preview_text,
+        )
 
     async def _run_codex_resume_streaming_prompt(
         self,
@@ -1034,6 +1042,7 @@ class CodexRunner:
     ) -> CodexStreamResult:
         args = [
             self.config.codex_bin,
+            "--full-auto",
             "exec",
             "resume",
             "-c",
@@ -1068,6 +1077,7 @@ class CodexRunner:
         last_emit_at = 0.0
         last_payload = ""
         session_id = resume_session_id
+        last_preview_text = ""
 
         async def emit(payload: str, force: bool = False) -> None:
             nonlocal last_emit_at
@@ -1080,7 +1090,7 @@ class CodexRunner:
             if payload == last_payload:
                 return
             now = time.monotonic()
-            if not force and now - last_emit_at < 0.03:
+            if not force and now - last_emit_at < STREAM_EMIT_INTERVAL_SECONDS:
                 return
             await on_update(payload)
             last_emit_at = now
@@ -1114,6 +1124,7 @@ class CodexRunner:
                         session_id = maybe_session_id
                     preview = _extract_resume_assistant_text(current_stdout)
                     if preview:
+                        last_preview_text = preview
                         await emit(preview)
                 trailing = stdout_decoder.decode(b"", final=True)
                 if trailing:
@@ -1133,6 +1144,8 @@ class CodexRunner:
         stdout = "".join(stdout_parts)
         stderr = "".join(stderr_lines)
         final_text = _extract_resume_assistant_text(stdout).strip()
+        if not final_text:
+            final_text = last_preview_text.strip()
 
         if timed_out:
             stderr = (
@@ -1158,7 +1171,12 @@ class CodexRunner:
             timed_out=timed_out,
         )
         await emit(final_text, force=True)
-        return CodexStreamResult(result=result, final_text=final_text, session_id=session_id)
+        return CodexStreamResult(
+            result=result,
+            final_text=final_text,
+            session_id=session_id,
+            preview_text=last_preview_text.strip() or final_text,
+        )
 
     async def run_shell_command(self, args: list[str]) -> CommandResult:
         if not self.config.working_dir_exists:
@@ -1770,19 +1788,52 @@ def _extract_resume_assistant_text(stdout_text: str) -> str:
     if not stdout_text:
         return ""
     normalized = stdout_text.replace("\r\n", "\n")
-    marker = "\ncodex\n"
-    marker_index = normalized.find(marker)
-    if marker_index < 0:
-        return ""
-    assistant_section = normalized[marker_index + len(marker) :]
-    footer_index = assistant_section.find("\ntokens used\n")
-    if footer_index >= 0:
-        assistant_section = assistant_section[:footer_index]
-    cleaned = assistant_section.strip()
-    if not cleaned:
-        return ""
+    sections = _parse_resume_transcript_sections(normalized)
+    assistant_sections = [
+        _dedupe_trailing_duplicate_lines(content)
+        for role, content in sections
+        if role == "codex" and content.strip()
+    ]
+    if assistant_sections:
+        return assistant_sections[-1].strip()
 
-    lines = [line.rstrip() for line in cleaned.splitlines()]
+    trailing_after_tokens = _extract_resume_trailing_after_tokens(sections)
+    if trailing_after_tokens:
+        return trailing_after_tokens
+    return ""
+
+
+def _parse_resume_transcript_sections(stdout_text: str) -> list[tuple[str, str]]:
+    header_pattern = re.compile(r"(?m)^(user|thinking|codex|tokens used)\s*$", flags=re.IGNORECASE)
+    matches = list(header_pattern.finditer(stdout_text))
+    sections: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        role = match.group(1).strip().lower()
+        content_start = match.end()
+        if content_start < len(stdout_text) and stdout_text[content_start] == "\n":
+            content_start += 1
+        content_end = matches[index + 1].start() if index + 1 < len(matches) else len(stdout_text)
+        content = stdout_text[content_start:content_end].strip("\n")
+        sections.append((role, content))
+    return sections
+
+
+def _extract_resume_trailing_after_tokens(sections: list[tuple[str, str]]) -> str:
+    for role, content in reversed(sections):
+        if role != "tokens used":
+            continue
+        lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            return ""
+        trailing = "\n".join(lines[1:]).strip()
+        if trailing and not _is_low_value_stream_text(trailing):
+            return _dedupe_trailing_duplicate_lines(trailing)
+        return ""
+    return ""
+
+
+def _dedupe_trailing_duplicate_lines(value: str) -> str:
+    lines = [line.rstrip() for line in value.splitlines()]
     while lines and not lines[-1].strip():
         lines.pop()
     if len(lines) >= 2 and lines[-1].strip() == lines[-2].strip():
