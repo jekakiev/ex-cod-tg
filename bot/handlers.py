@@ -22,6 +22,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from bot.codex_runner import (
     DEFAULT_REASONING_LEVELS,
     DEFAULT_SELECTED_MODELS,
+    SUPPORTED_CODEX_SANDBOX_MODES,
     AsyncCommandQueue,
     BotUpdateState,
     CodexAuthState,
@@ -30,6 +31,7 @@ from bot.codex_runner import (
     EnvironmentStatus,
     GitHubAuthState,
     WhisperState,
+    normalize_codex_sandbox_mode,
     normalize_model_slug,
 )
 from bot.conversation_store import BranchConversationState, BranchConversationStore, ConversationSummary, NO_GIT_BRANCH_KEY
@@ -54,6 +56,7 @@ from bot.ui import (
     admins_keyboard,
     build_admins_text,
     build_codex_text,
+    build_execution_mode_text,
     build_github_text,
     build_home_text,
     build_selected_models_text,
@@ -61,6 +64,7 @@ from bot.ui import (
     build_voice_preview_text,
     build_workspaces_root_text,
     codex_keyboard,
+    execution_mode_keyboard,
     github_keyboard,
     home_keyboard,
     model_label,
@@ -84,7 +88,11 @@ logger = logging.getLogger(__name__)
 router = Router(name=__name__)
 UPDATE_CHECK_TTL_SECONDS = 120
 STATUS_CACHE_TTL_SECONDS = 5
+STATUS_ERROR_CACHE_TTL_SECONDS = 60
 MODEL_CATALOG_CACHE_TTL_SECONDS = 60
+STATUS_REFRESH_TIMEOUT_SECONDS = 2.5
+UPDATE_REFRESH_TIMEOUT_SECONDS = 4.0
+UPDATE_ERROR_CACHE_TTL_SECONDS = 300
 STREAM_UPDATE_INTERVAL_SECONDS = 0.25
 STREAM_KEEPALIVE_INTERVAL_SECONDS = 1.2
 STREAM_DRAFT_RETRY_GRACE_SECONDS = 0.2
@@ -241,14 +249,19 @@ class AppContext:
     flash_message: str | None = None
     cached_update_state: BotUpdateState | None = None
     update_checked_at: float = 0.0
+    update_refresh_task: asyncio.Task[BotUpdateState] | None = None
     cached_environment_status: EnvironmentStatus | None = None
     environment_checked_at: float = 0.0
+    environment_refresh_task: asyncio.Task[EnvironmentStatus] | None = None
     cached_auth_state: CodexAuthState | None = None
     auth_checked_at: float = 0.0
+    auth_refresh_task: asyncio.Task[CodexAuthState] | None = None
     cached_github_state: GitHubAuthState | None = None
     github_checked_at: float = 0.0
+    github_refresh_task: asyncio.Task[GitHubAuthState] | None = None
     cached_whisper_state: WhisperState | None = None
     whisper_checked_at: float = 0.0
+    whisper_refresh_task: asyncio.Task[WhisperState] | None = None
     cached_model_catalog: list[CodexModelInfo] | None = None
     model_catalog_checked_at: float = 0.0
     update_progress: BotUpdateProgress | None = None
@@ -782,6 +795,26 @@ async def selected_models_toggle_callback(query: CallbackQuery, app_context: App
     await query.answer("Selected models updated.")
 
 
+@router.callback_query(F.data.startswith("execution_mode:set:"))
+async def execution_mode_set_callback(query: CallbackQuery, app_context: AppContext) -> None:
+    if not await _ensure_authorized_callback(query, app_context):
+        return
+    target_mode = normalize_codex_sandbox_mode(query.data.rsplit(":", 1)[1])
+    if target_mode not in SUPPORTED_CODEX_SANDBOX_MODES:
+        await query.answer("Unknown execution mode.", show_alert=True)
+        return
+    if target_mode == app_context.config.codex_sandbox_mode:
+        await query.answer("Execution mode already set.")
+        return
+
+    await _set_codex_preferences(app_context, sandbox_mode=target_mode)
+    await _show_dashboard_from_callback(query, app_context, page="execution_mode")
+    if target_mode == "danger-full-access":
+        await query.answer("Full access enabled. Codex can now commit and push.", show_alert=True)
+    else:
+        await query.answer("Workspace write mode enabled.")
+
+
 @router.callback_query(F.data == "admin:add")
 async def admin_add_callback(query: CallbackQuery, app_context: AppContext) -> None:
     if not await _ensure_authorized_callback(query, app_context):
@@ -873,6 +906,7 @@ async def codex_refresh_callback(query: CallbackQuery, app_context: AppContext) 
         return
     app_context.cached_auth_state = None
     app_context.auth_checked_at = 0.0
+    app_context.auth_refresh_task = None
     await _show_dashboard_from_callback(query, app_context, page="codex")
     await query.answer("Refreshed.")
 
@@ -931,13 +965,15 @@ async def codex_cancel_login_callback(query: CallbackQuery, app_context: AppCont
         await _show_dashboard_from_callback(query, app_context, page="codex")
         return
 
-    session.process.kill()
+    with suppress(ProcessLookupError):
+        session.process.kill()
     with suppress(ProcessLookupError):
         await session.process.wait()
     session.completed = True
     session.returncode = session.process.returncode
     app_context.cached_auth_state = None
     app_context.auth_checked_at = 0.0
+    app_context.auth_refresh_task = None
 
     await _show_dashboard_from_callback(query, app_context, page="codex")
     await query.answer("Login flow cancelled.")
@@ -957,6 +993,7 @@ async def codex_logout_callback(query: CallbackQuery, app_context: AppContext) -
 
     app_context.cached_auth_state = None
     app_context.auth_checked_at = 0.0
+    app_context.auth_refresh_task = None
     await _show_dashboard_from_callback(query, app_context, page="codex")
     if result.ok:
         await query.answer("Logged out.")
@@ -971,6 +1008,7 @@ async def github_refresh_callback(query: CallbackQuery, app_context: AppContext)
         return
     app_context.cached_github_state = None
     app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
     await _show_dashboard_from_callback(query, app_context, page="github")
     await query.answer("Refreshed.")
 
@@ -1040,13 +1078,15 @@ async def github_cancel_login_callback(query: CallbackQuery, app_context: AppCon
         await _show_dashboard_from_callback(query, app_context, page="github")
         return
 
-    session.process.kill()
+    with suppress(ProcessLookupError):
+        session.process.kill()
     with suppress(ProcessLookupError):
         await session.process.wait()
     session.completed = True
     session.returncode = session.process.returncode
     app_context.cached_github_state = None
     app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
 
     await _show_dashboard_from_callback(query, app_context, page="github")
     await query.answer("Login flow cancelled.")
@@ -1091,6 +1131,7 @@ async def github_logout_callback(query: CallbackQuery, app_context: AppContext) 
 
     app_context.cached_github_state = None
     app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
     await _show_dashboard_from_callback(query, app_context, page="github")
     if result.ok:
         await query.answer("Logged out.")
@@ -1148,6 +1189,7 @@ async def github_test_callback(query: CallbackQuery, app_context: AppContext) ->
     app_context.flash_message = f"{prefix}\n" + "\n".join(lines)
     app_context.cached_github_state = None
     app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
     await _show_dashboard_from_callback(query, app_context, page="github")
 
 
@@ -1476,90 +1518,290 @@ async def _projects_with_active_selection(app_context: AppContext) -> list[Works
     return projects
 
 
-async def _get_bot_update_state(app_context: AppContext, *, force: bool = False) -> BotUpdateState:
-    now = time.monotonic()
-    if (
-        not force
-        and app_context.cached_update_state is not None
-        and now - app_context.update_checked_at < UPDATE_CHECK_TTL_SECONDS
-    ):
-        return app_context.cached_update_state
+def _unavailable_auth_state(app_context: AppContext, reason: str) -> CodexAuthState:
+    cli_path = app_context.runner.codex_path()
+    if cli_path is None:
+        return CodexAuthState(
+            cli_path=None,
+            cli_version=None,
+            logged_in=False,
+            auth_mode=None,
+            auth_provider=None,
+            account_name=None,
+            account_email=None,
+            status_summary="CLI not found",
+            raw_status="Codex CLI was not found on PATH.",
+        )
+    return CodexAuthState(
+        cli_path=cli_path,
+        cli_version=None,
+        logged_in=False,
+        auth_mode=None,
+        auth_provider=None,
+        account_name=None,
+        account_email=None,
+        status_summary="Status unavailable",
+        raw_status=reason,
+        probe_ok=False,
+    )
 
-    update_state = await app_context.runner.collect_bot_update_state()
-    app_context.cached_update_state = update_state
-    app_context.update_checked_at = now
-    return update_state
+
+def _unavailable_github_state(app_context: AppContext, reason: str) -> GitHubAuthState:
+    cli_path = app_context.runner.gh_path()
+    if cli_path is None:
+        return GitHubAuthState(
+            cli_path=None,
+            cli_version=None,
+            logged_in=False,
+            host="github.com",
+            login=None,
+            token_source=None,
+            scopes=None,
+            git_protocol=None,
+            status_summary="CLI not found",
+            raw_status="GitHub CLI was not found on PATH.",
+        )
+    return GitHubAuthState(
+        cli_path=cli_path,
+        cli_version=None,
+        logged_in=False,
+        host="github.com",
+        login=None,
+        token_source=None,
+        scopes=None,
+        git_protocol=None,
+        status_summary="Status unavailable",
+        raw_status=reason,
+        probe_ok=False,
+    )
 
 
-async def _get_environment_status(app_context: AppContext, *, force: bool = False) -> EnvironmentStatus:
-    now = time.monotonic()
-    if (
-        not force
-        and app_context.cached_environment_status is not None
-        and now - app_context.environment_checked_at < STATUS_CACHE_TTL_SECONDS
-    ):
-        return app_context.cached_environment_status
+def _unavailable_whisper_state(app_context: AppContext, reason: str) -> WhisperState:
+    return WhisperState(
+        installed=False,
+        model_name=app_context.runner.whisper_model_name(),
+        summary="Status unavailable",
+        details=reason,
+        probe_ok=False,
+    )
 
-    environment = await app_context.runner.collect_environment_status(
+
+def _unavailable_update_state(app_context: AppContext, reason: str) -> BotUpdateState:
+    cached = app_context.cached_update_state
+    return BotUpdateState(
+        installed_commit=cached.installed_commit if cached else None,
+        latest_commit=cached.latest_commit if cached else None,
+        latest_version=cached.latest_version if cached else None,
+        latest_summary=cached.latest_summary if cached else None,
+        latest_notes=list(cached.latest_notes) if cached else [],
+        update_available=False,
+        check_ok=False,
+        status_summary="Update check unavailable",
+    )
+
+
+def _unavailable_environment_status(app_context: AppContext) -> EnvironmentStatus:
+    git_repo = (app_context.config.working_dir / ".git").exists() if app_context.config.working_dir_exists else False
+    return EnvironmentStatus(
+        workspaces_root=app_context.config.workspaces_root,
+        workspaces_root_exists=app_context.config.workspaces_root_exists,
+        working_dir=app_context.config.working_dir,
+        working_dir_exists=app_context.config.working_dir_exists,
+        codex_path=app_context.runner.codex_path(),
+        git_repo=git_repo,
+        git_branch=None,
+        latest_commit_summary=None,
+        changed_files_count=None,
         active_job=app_context.queue.active_label,
         queued_jobs=app_context.queue.waiting_count,
     )
-    app_context.cached_environment_status = environment
-    app_context.environment_checked_at = now
-    return environment
+
+
+def _track_refresh_task(
+    app_context: AppContext,
+    *,
+    task_attr: str,
+    cached_attr: str,
+    checked_at_attr: str,
+    task: asyncio.Task[Any],
+    label: str,
+) -> None:
+    setattr(app_context, task_attr, task)
+
+    def _store_result(done_task: asyncio.Task[Any]) -> None:
+        if getattr(app_context, task_attr) is done_task:
+            setattr(app_context, task_attr, None)
+        try:
+            result = done_task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("%s refresh failed", label)
+            return
+        setattr(app_context, cached_attr, result)
+        setattr(app_context, checked_at_attr, time.monotonic())
+
+    task.add_done_callback(_store_result)
+
+
+async def _resolve_refresh(
+    app_context: AppContext,
+    *,
+    force: bool,
+    cached_attr: str,
+    checked_at_attr: str,
+    task_attr: str,
+    success_ttl: float,
+    error_ttl: float,
+    timeout_seconds: float,
+    fetcher: Callable[[], Awaitable[Any]],
+    fallback_factory: Callable[[], Any],
+    ok_attr: str,
+    label: str,
+) -> Any:
+    now = time.monotonic()
+    cached = getattr(app_context, cached_attr)
+    checked_at = getattr(app_context, checked_at_attr)
+    ttl = success_ttl if cached is None else (success_ttl if getattr(cached, ok_attr, True) else error_ttl)
+    if not force and cached is not None and now - checked_at < ttl:
+        return cached
+
+    task = getattr(app_context, task_attr)
+    if task is None or task.done():
+        task = asyncio.create_task(fetcher(), name=f"{label}-refresh")
+        _track_refresh_task(
+            app_context,
+            task_attr=task_attr,
+            cached_attr=cached_attr,
+            checked_at_attr=checked_at_attr,
+            task=task,
+            label=label,
+        )
+
+    if cached is not None and not force:
+        return cached
+
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.warning("%s refresh exceeded %.1fs", label, timeout_seconds)
+    except Exception:
+        logger.exception("%s refresh failed", label)
+
+    fallback = cached if cached is not None else fallback_factory()
+    setattr(app_context, cached_attr, fallback)
+    setattr(app_context, checked_at_attr, now)
+    return fallback
+
+
+async def _get_bot_update_state(app_context: AppContext, *, force: bool = False) -> BotUpdateState:
+    return await _resolve_refresh(
+        app_context,
+        force=force,
+        cached_attr="cached_update_state",
+        checked_at_attr="update_checked_at",
+        task_attr="update_refresh_task",
+        success_ttl=UPDATE_CHECK_TTL_SECONDS,
+        error_ttl=UPDATE_ERROR_CACHE_TTL_SECONDS,
+        timeout_seconds=UPDATE_REFRESH_TIMEOUT_SECONDS,
+        fetcher=app_context.runner.collect_bot_update_state,
+        fallback_factory=lambda: _unavailable_update_state(
+            app_context,
+            "Update check is taking too long. Try again from Settings.",
+        ),
+        ok_attr="check_ok",
+        label="bot update state",
+    )
+
+
+async def _get_environment_status(app_context: AppContext, *, force: bool = False) -> EnvironmentStatus:
+    return await _resolve_refresh(
+        app_context,
+        force=force,
+        cached_attr="cached_environment_status",
+        checked_at_attr="environment_checked_at",
+        task_attr="environment_refresh_task",
+        success_ttl=STATUS_CACHE_TTL_SECONDS,
+        error_ttl=STATUS_ERROR_CACHE_TTL_SECONDS,
+        timeout_seconds=STATUS_REFRESH_TIMEOUT_SECONDS,
+        fetcher=lambda: app_context.runner.collect_environment_status(
+            active_job=app_context.queue.active_label,
+            queued_jobs=app_context.queue.waiting_count,
+        ),
+        fallback_factory=lambda: _unavailable_environment_status(app_context),
+        ok_attr="working_dir_exists",
+        label="environment status",
+    )
 
 
 async def _get_auth_state(app_context: AppContext, *, force: bool = False) -> CodexAuthState:
-    now = time.monotonic()
-    if (
-        not force
-        and app_context.cached_auth_state is not None
-        and now - app_context.auth_checked_at < STATUS_CACHE_TTL_SECONDS
-    ):
-        return app_context.cached_auth_state
-
-    auth_state = await app_context.runner.collect_codex_auth_state()
-    app_context.cached_auth_state = auth_state
-    app_context.auth_checked_at = now
-    return auth_state
+    return await _resolve_refresh(
+        app_context,
+        force=force,
+        cached_attr="cached_auth_state",
+        checked_at_attr="auth_checked_at",
+        task_attr="auth_refresh_task",
+        success_ttl=STATUS_CACHE_TTL_SECONDS,
+        error_ttl=STATUS_ERROR_CACHE_TTL_SECONDS,
+        timeout_seconds=STATUS_REFRESH_TIMEOUT_SECONDS,
+        fetcher=app_context.runner.collect_codex_auth_state,
+        fallback_factory=lambda: _unavailable_auth_state(
+            app_context,
+            "Codex CLI status check is taking too long. Open Settings -> Codex CLI and tap Refresh.",
+        ),
+        ok_attr="probe_ok",
+        label="codex auth state",
+    )
 
 
 async def _get_github_state(app_context: AppContext, *, force: bool = False) -> GitHubAuthState:
-    now = time.monotonic()
-    if (
-        not force
-        and app_context.cached_github_state is not None
-        and now - app_context.github_checked_at < STATUS_CACHE_TTL_SECONDS
-    ):
-        return app_context.cached_github_state
-
-    github_state = await app_context.runner.collect_github_auth_state()
-    app_context.cached_github_state = github_state
-    app_context.github_checked_at = now
-    return github_state
+    return await _resolve_refresh(
+        app_context,
+        force=force,
+        cached_attr="cached_github_state",
+        checked_at_attr="github_checked_at",
+        task_attr="github_refresh_task",
+        success_ttl=STATUS_CACHE_TTL_SECONDS,
+        error_ttl=STATUS_ERROR_CACHE_TTL_SECONDS,
+        timeout_seconds=STATUS_REFRESH_TIMEOUT_SECONDS,
+        fetcher=app_context.runner.collect_github_auth_state,
+        fallback_factory=lambda: _unavailable_github_state(
+            app_context,
+            "GitHub status check is taking too long. Open Settings -> GitHub and tap Refresh.",
+        ),
+        ok_attr="probe_ok",
+        label="github auth state",
+    )
 
 
 def _home_codex_notice(auth_state: CodexAuthState) -> str | None:
     if auth_state.cli_path is None:
         return "Codex CLI is not installed. Re-run the installer to install it automatically."
+    if not auth_state.probe_ok:
+        return "Codex CLI status is temporarily unavailable. Open Settings -> Codex CLI to retry."
     if auth_state.logged_in:
         return None
     return "Codex CLI is not authorized yet. Open Settings -> Codex CLI to log in."
 
 
 async def _get_whisper_state(app_context: AppContext, *, force: bool = False) -> WhisperState:
-    now = time.monotonic()
-    if (
-        not force
-        and app_context.cached_whisper_state is not None
-        and now - app_context.whisper_checked_at < STATUS_CACHE_TTL_SECONDS
-    ):
-        return app_context.cached_whisper_state
-
-    whisper_state = await app_context.runner.collect_whisper_state()
-    app_context.cached_whisper_state = whisper_state
-    app_context.whisper_checked_at = now
-    return whisper_state
+    return await _resolve_refresh(
+        app_context,
+        force=force,
+        cached_attr="cached_whisper_state",
+        checked_at_attr="whisper_checked_at",
+        task_attr="whisper_refresh_task",
+        success_ttl=STATUS_CACHE_TTL_SECONDS,
+        error_ttl=STATUS_ERROR_CACHE_TTL_SECONDS,
+        timeout_seconds=STATUS_REFRESH_TIMEOUT_SECONDS,
+        fetcher=app_context.runner.collect_whisper_state,
+        fallback_factory=lambda: _unavailable_whisper_state(
+            app_context,
+            "Whisper runtime detection is taking too long. Open Settings and retry from there.",
+        ),
+        ok_attr="probe_ok",
+        label="whisper state",
+    )
 
 
 def _get_model_catalog(app_context: AppContext, *, force: bool = False) -> list[CodexModelInfo]:
@@ -1694,8 +1936,16 @@ async def _set_active_project(app_context: AppContext, project_path: Path) -> No
     object.__setattr__(app_context.config, "active_project_path", resolved)
     app_context.cached_environment_status = None
     app_context.environment_checked_at = 0.0
+    app_context.environment_refresh_task = None
     app_context.cached_auth_state = None
     app_context.auth_checked_at = 0.0
+    app_context.auth_refresh_task = None
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
+    app_context.cached_whisper_state = None
+    app_context.whisper_checked_at = 0.0
+    app_context.whisper_refresh_task = None
 
 
 async def _set_codex_preferences(
@@ -1704,14 +1954,17 @@ async def _set_codex_preferences(
     codex_model: str | None = None,
     selected_models: list[str] | None = None,
     thinking_level: str | None = None,
+    sandbox_mode: str | None = None,
 ) -> None:
     normalized_model = normalize_model_slug(codex_model) if codex_model is not None else None
     normalized_selected = [normalize_model_slug(item) for item in selected_models] if selected_models is not None else None
+    normalized_sandbox_mode = normalize_codex_sandbox_mode(sandbox_mode) if sandbox_mode is not None else None
     update_codex_preferences(
         app_context.config.config_file,
         codex_model=normalized_model,
         selected_models=normalized_selected,
         thinking_level=thinking_level,
+        sandbox_mode=normalized_sandbox_mode,
     )
     if normalized_model is not None:
         object.__setattr__(app_context.config, "codex_model", normalized_model)
@@ -1719,6 +1972,8 @@ async def _set_codex_preferences(
         object.__setattr__(app_context.config, "codex_selected_models", tuple(normalized_selected))
     if thinking_level is not None:
         object.__setattr__(app_context.config, "codex_thinking_level", thinking_level)
+    if normalized_sandbox_mode is not None:
+        object.__setattr__(app_context.config, "codex_sandbox_mode", normalized_sandbox_mode)
 
 
 async def _git_branches_for_active_project(app_context: AppContext) -> tuple[list[str], str | None]:
@@ -1772,8 +2027,16 @@ async def _set_workspaces_root(app_context: AppContext, root_path: Path) -> None
     object.__setattr__(app_context.config, "active_project_path", active_project)
     app_context.cached_environment_status = None
     app_context.environment_checked_at = 0.0
+    app_context.environment_refresh_task = None
     app_context.cached_auth_state = None
     app_context.auth_checked_at = 0.0
+    app_context.auth_refresh_task = None
+    app_context.cached_github_state = None
+    app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
+    app_context.cached_whisper_state = None
+    app_context.whisper_checked_at = 0.0
+    app_context.whisper_refresh_task = None
 
 
 async def _handle_pending_workspaces_root_message(message: Message, app_context: AppContext) -> bool:
@@ -1838,6 +2101,7 @@ async def _handle_pending_github_token_message(message: Message, app_context: Ap
 
     app_context.cached_github_state = None
     app_context.github_checked_at = 0.0
+    app_context.github_refresh_task = None
     github_state = await _get_github_state(app_context, force=True)
 
     if login_result.ok and github_state.logged_in:
@@ -2844,10 +3108,12 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
     active_thinking_level = _effective_thinking_level(app_context, app_context.config.codex_model)
 
     if page == "home":
-        environment = await _get_environment_status(app_context)
-        auth_state = await _get_auth_state(app_context)
-        whisper_state = await _get_whisper_state(app_context)
-        update_state = await _get_bot_update_state(app_context)
+        environment, auth_state, whisper_state, update_state = await asyncio.gather(
+            _get_environment_status(app_context),
+            _get_auth_state(app_context),
+            _get_whisper_state(app_context),
+            _get_bot_update_state(app_context),
+        )
         flash_message = app_context.flash_message
         app_context.flash_message = None
         text = build_home_text(
@@ -2875,10 +3141,12 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "repos":
-        environment = await _get_environment_status(app_context)
-        auth_state = await _get_auth_state(app_context)
-        whisper_state = await _get_whisper_state(app_context)
-        update_state = await _get_bot_update_state(app_context)
+        environment, auth_state, whisper_state, update_state = await asyncio.gather(
+            _get_environment_status(app_context),
+            _get_auth_state(app_context),
+            _get_whisper_state(app_context),
+            _get_bot_update_state(app_context),
+        )
         return (
             build_home_text(
                 environment=environment,
@@ -2904,10 +3172,12 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "branches":
-        environment = await _get_environment_status(app_context)
-        auth_state = await _get_auth_state(app_context)
-        whisper_state = await _get_whisper_state(app_context)
-        update_state = await _get_bot_update_state(app_context)
+        environment, auth_state, whisper_state, update_state = await asyncio.gather(
+            _get_environment_status(app_context),
+            _get_auth_state(app_context),
+            _get_whisper_state(app_context),
+            _get_bot_update_state(app_context),
+        )
         return (
             build_home_text(
                 environment=environment,
@@ -2933,10 +3203,12 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
         )
 
     if page == "settings":
-        auth_state = await _get_auth_state(app_context)
-        github_state = await _get_github_state(app_context)
-        whisper_state = await _get_whisper_state(app_context)
-        update_state = await _get_bot_update_state(app_context)
+        auth_state, github_state, whisper_state, update_state = await asyncio.gather(
+            _get_auth_state(app_context),
+            _get_github_state(app_context),
+            _get_whisper_state(app_context),
+            _get_bot_update_state(app_context),
+        )
         update_progress = app_context.update_progress
         whisper_progress = app_context.whisper_progress
         flash_message = app_context.flash_message
@@ -2948,17 +3220,25 @@ async def _render_page(app_context: AppContext, *, page: str) -> tuple[str, Any]
                 github_state=github_state,
                 whisper_state=whisper_state,
                 update_state=update_state,
+                codex_execution_mode=app_context.config.codex_sandbox_mode,
                 workspaces_root=app_context.config.workspaces_root,
                 whisper_progress_block=_render_whisper_progress_block(whisper_progress),
                 update_progress_block=_render_update_progress_block(update_progress),
                 flash_message=flash_message,
             ),
             settings_keyboard(
+                codex_execution_mode=app_context.config.codex_sandbox_mode,
                 whisper_state=whisper_state,
                 whisper_busy=whisper_busy,
                 update_busy=bool(update_progress and update_progress.in_progress),
                 update_confirm_pending=bool(update_progress and update_progress.awaiting_confirmation),
             ),
+        )
+
+    if page == "execution_mode":
+        return (
+            build_execution_mode_text(codex_execution_mode=app_context.config.codex_sandbox_mode),
+            execution_mode_keyboard(codex_execution_mode=app_context.config.codex_sandbox_mode),
         )
 
     if page == "github":
@@ -3259,6 +3539,7 @@ async def _perform_bot_update(
         )
         app_context.cached_update_state = None
         app_context.update_checked_at = 0.0
+        app_context.update_refresh_task = None
 
         if not install_result.ok:
             progress.in_progress = False
@@ -3393,8 +3674,10 @@ async def _perform_whisper_install(
 
         app_context.cached_whisper_state = None
         app_context.whisper_checked_at = 0.0
+        app_context.whisper_refresh_task = None
         app_context.cached_environment_status = None
         app_context.environment_checked_at = 0.0
+        app_context.environment_refresh_task = None
         app_context.whisper_progress = None
         app_context.flash_message = f"✅ Whisper installed ({app_context.runner.whisper_model_name()})"
         await _refresh_dashboard_for_chat(
@@ -3491,8 +3774,10 @@ async def _perform_whisper_delete(
 
         app_context.cached_whisper_state = None
         app_context.whisper_checked_at = 0.0
+        app_context.whisper_refresh_task = None
         app_context.cached_environment_status = None
         app_context.environment_checked_at = 0.0
+        app_context.environment_refresh_task = None
         app_context.whisper_progress = None
         app_context.flash_message = "✅ Whisper removed"
         await _refresh_dashboard_for_chat(

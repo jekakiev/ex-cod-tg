@@ -7,7 +7,13 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from bot.codex_runner import DEFAULT_SELECTED_MODELS, normalize_model_slug
+from bot.codex_runner import (
+    DEFAULT_CODEX_SANDBOX_MODE,
+    DEFAULT_SELECTED_MODELS,
+    SUPPORTED_CODEX_SANDBOX_MODES,
+    normalize_codex_sandbox_mode,
+    normalize_model_slug,
+)
 from bot.workspaces import choose_active_project, detect_workspaces_root
 
 
@@ -42,6 +48,7 @@ class AppConfig:
     codex_model: str
     codex_selected_models: tuple[str, ...]
     codex_thinking_level: str
+    codex_sandbox_mode: str
     command_timeout_seconds: int
     shell_timeout_seconds: int
     git_timeout_seconds: int
@@ -71,6 +78,7 @@ class AppConfig:
             "CODEX_MODEL",
             "CODEX_SELECTED_MODELS",
             "CODEX_THINKING_LEVEL",
+            "CODEX_SANDBOX_MODE",
             "COMMAND_TIMEOUT_SECONDS",
             "SHELL_TIMEOUT_SECONDS",
             "GIT_TIMEOUT_SECONDS",
@@ -121,6 +129,9 @@ class AppConfig:
                 fallback=(normalize_model_slug(default_codex_model), *DEFAULT_SELECTED_MODELS[1:]),
             ),
             codex_thinking_level=merged_values.get("CODEX_THINKING_LEVEL", default_thinking_level).strip() or default_thinking_level,
+            codex_sandbox_mode=_parse_codex_sandbox_mode(
+                merged_values.get("CODEX_SANDBOX_MODE", DEFAULT_CODEX_SANDBOX_MODE)
+            ),
             command_timeout_seconds=_parse_positive_int_from_values(
                 merged_values,
                 "COMMAND_TIMEOUT_SECONDS",
@@ -217,3 +228,11 @@ def _load_default_codex_preferences() -> tuple[str, str]:
 def _parse_selected_models(raw_value: str, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
     models = tuple(normalize_model_slug(item) for item in raw_value.split(",") if item.strip())
     return models or fallback
+
+
+def _parse_codex_sandbox_mode(raw_value: str) -> str:
+    mode = normalize_codex_sandbox_mode(raw_value)
+    if mode not in SUPPORTED_CODEX_SANDBOX_MODES:
+        supported = ", ".join(SUPPORTED_CODEX_SANDBOX_MODES)
+        raise ConfigError(f"CODEX_SANDBOX_MODE must be one of: {supported}. Got {raw_value!r}")
+    return mode

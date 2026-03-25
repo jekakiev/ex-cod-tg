@@ -6,7 +6,15 @@ from pathlib import Path
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.codex_runner import BotUpdateState, CodexAuthState, EnvironmentStatus, GitHubAuthState, WhisperState, normalize_model_slug
+from bot.codex_runner import (
+    BotUpdateState,
+    CodexAuthState,
+    EnvironmentStatus,
+    GitHubAuthState,
+    WhisperState,
+    normalize_codex_sandbox_mode,
+    normalize_model_slug,
+)
 from bot.version import APP_VERSION
 
 
@@ -51,6 +59,15 @@ def thinking_label(value: str) -> str:
         "xhigh": "Very detailed",
     }
     return mapping.get(value, value)
+
+
+def execution_mode_label(value: str) -> str:
+    normalized = normalize_codex_sandbox_mode(value)
+    mapping = {
+        "workspace-write": "Workspace write",
+        "danger-full-access": "Full access",
+    }
+    return mapping.get(normalized, normalized)
 
 
 def build_home_text(
@@ -202,6 +219,7 @@ def build_settings_text(
     github_state: GitHubAuthState,
     whisper_state: WhisperState,
     update_state: BotUpdateState,
+    codex_execution_mode: str,
     workspaces_root: Path,
     whisper_progress_block: str | None,
     update_progress_block: str | None,
@@ -213,6 +231,7 @@ def build_settings_text(
         f"Workspaces root: <code>{html.escape(str(workspaces_root))}</code>\n"
         f"Codex auth: <code>{html.escape(auth_state.account_summary or auth_state.status_summary)}</code>\n"
         f"GitHub: <code>{html.escape(github_state.status_summary)}</code>\n"
+        f"Execution mode: <code>{html.escape(execution_mode_label(codex_execution_mode))}</code>\n"
         f"Whisper: <code>{html.escape(whisper_state.summary)}</code>\n"
         f"Bot updates: <code>{html.escape(update_state.status_summary)}</code>"
     )
@@ -227,6 +246,7 @@ def build_settings_text(
 
 def settings_keyboard(
     *,
+    codex_execution_mode: str,
     whisper_state: WhisperState,
     whisper_busy: bool,
     update_busy: bool,
@@ -262,6 +282,13 @@ def settings_keyboard(
         ],
         [
             InlineKeyboardButton(
+                text=f"Execution: {execution_mode_label(codex_execution_mode)}",
+                callback_data="nav:execution_mode",
+            ),
+            InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
+        ],
+        [
+            InlineKeyboardButton(
                 text=(
                     "⏳ Whisper…"
                     if whisper_busy
@@ -277,11 +304,55 @@ def settings_keyboard(
                     else "whisper:install"
                 ),
             ),
-            InlineKeyboardButton(text="Workspaces Root", callback_data="nav:workspaces_root"),
+            InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run"),
         ],
     ]
-    rows.append([InlineKeyboardButton(text="⬆️ Update bot", callback_data="update:run")])
     rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:home")])
+    return _keyboard(rows)
+
+
+def build_execution_mode_text(*, codex_execution_mode: str) -> str:
+    current = normalize_codex_sandbox_mode(codex_execution_mode)
+    current_label = execution_mode_label(current)
+    notes = [
+        "<b>Execution mode</b>",
+        "",
+        "Choose how much access Codex gets when it runs from Telegram.",
+        f"Current mode: <code>{html.escape(current_label)}</code>",
+        "",
+        "<b>Workspace write</b>",
+        "Can edit files in the repo, but may fail on git metadata writes and networked actions like push.",
+        "",
+        "<b>Full access</b>",
+        "Lets Codex run git add/commit/push and other unrestricted local commands. Use it only if you trust all bot admins.",
+    ]
+    if current == "danger-full-access":
+        notes.extend(
+            [
+                "",
+                "<blockquote>Full access is enabled. Codex can now write to .git and use the network from Telegram tasks.</blockquote>",
+            ]
+        )
+    return "\n".join(notes)
+
+
+def execution_mode_keyboard(*, codex_execution_mode: str) -> InlineKeyboardMarkup:
+    current = normalize_codex_sandbox_mode(codex_execution_mode)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{'✅' if current == 'workspace-write' else '⬜️'} Workspace write",
+                callback_data="execution_mode:set:workspace-write",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'✅' if current == 'danger-full-access' else '⬜️'} Full access",
+                callback_data="execution_mode:set:danger-full-access",
+            ),
+        ],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:settings")],
+    ]
     return _keyboard(rows)
 
 
@@ -641,7 +712,7 @@ def response_controls_keyboard(*, current_model: str, current_thinking_level: st
                     callback_data="quick:thinking",
                 ),
             ],
-            [InlineKeyboardButton(text="🏠 Головне меню", callback_data="nav:main_menu")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="nav:main_menu")],
         ]
     )
 

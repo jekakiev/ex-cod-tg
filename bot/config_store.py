@@ -13,6 +13,7 @@ DEFAULT_CONFIG_VALUES = {
     "CODEX_MODEL": "gpt-5.4",
     "CODEX_SELECTED_MODELS": "gpt-5.4,gpt-5.4-mini",
     "CODEX_THINKING_LEVEL": "high",
+    "CODEX_SANDBOX_MODE": "workspace-write",
     "COMMAND_TIMEOUT_SECONDS": "900",
     "SHELL_TIMEOUT_SECONDS": "120",
     "GIT_TIMEOUT_SECONDS": "120",
@@ -48,6 +49,7 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
         f"CODEX_MODEL={format_env_value(serialized['CODEX_MODEL'])}",
         f"CODEX_SELECTED_MODELS={format_env_value(serialized['CODEX_SELECTED_MODELS'])}",
         f"CODEX_THINKING_LEVEL={format_env_value(serialized['CODEX_THINKING_LEVEL'])}",
+        f"CODEX_SANDBOX_MODE={format_env_value(serialized['CODEX_SANDBOX_MODE'])}",
         f"COMMAND_TIMEOUT_SECONDS={format_env_value(serialized['COMMAND_TIMEOUT_SECONDS'])}",
         f"SHELL_TIMEOUT_SECONDS={format_env_value(serialized['SHELL_TIMEOUT_SECONDS'])}",
         f"GIT_TIMEOUT_SECONDS={format_env_value(serialized['GIT_TIMEOUT_SECONDS'])}",
@@ -156,6 +158,7 @@ def update_codex_preferences(
     codex_model: str | None = None,
     selected_models: list[str] | None = None,
     thinking_level: str | None = None,
+    sandbox_mode: str | None = None,
 ) -> dict[str, str]:
     values = load_env_file(path)
     if codex_model is not None:
@@ -164,6 +167,8 @@ def update_codex_preferences(
         values["CODEX_SELECTED_MODELS"] = ",".join(item.strip() for item in selected_models if item.strip())
     if thinking_level is not None:
         values["CODEX_THINKING_LEVEL"] = thinking_level.strip()
+    if sandbox_mode is not None:
+        values["CODEX_SANDBOX_MODE"] = sandbox_mode.strip()
     write_env_file(path, values)
     return values
 

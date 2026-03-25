@@ -38,7 +38,22 @@ MODEL_ALIAS_MAP = {
 }
 DEFAULT_SELECTED_MODELS = ("gpt-5.4", "gpt-5.4-mini")
 DEFAULT_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
+DEFAULT_CODEX_SANDBOX_MODE = "workspace-write"
+SUPPORTED_CODEX_SANDBOX_MODES = ("workspace-write", "danger-full-access")
+CODEX_SANDBOX_MODE_ALIAS_MAP = {
+    "workspace_write": "workspace-write",
+    "workspace-write": "workspace-write",
+    "workspace": "workspace-write",
+    "danger-full-access": "danger-full-access",
+    "danger_full_access": "danger-full-access",
+    "danger": "danger-full-access",
+    "full-access": "danger-full-access",
+    "full_access": "danger-full-access",
+}
 STREAM_EMIT_INTERVAL_SECONDS = 0.25
+STATUS_PROBE_TIMEOUT_SECONDS = 4
+GITHUB_LIVE_PROBE_TIMEOUT_SECONDS = 5
+WHISPER_RUNTIME_PROBE_TIMEOUT_SECONDS = 4
 
 
 @dataclass(slots=True)
@@ -87,6 +102,13 @@ def normalize_model_slug(value: str) -> str:
     return MODEL_ALIAS_MAP.get(normalized, normalized)
 
 
+def normalize_codex_sandbox_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if not normalized:
+        return DEFAULT_CODEX_SANDBOX_MODE
+    return CODEX_SANDBOX_MODE_ALIAS_MAP.get(normalized, normalized)
+
+
 @dataclass(slots=True)
 class CodexAuthState:
     cli_path: str | None
@@ -98,6 +120,7 @@ class CodexAuthState:
     account_email: str | None
     status_summary: str
     raw_status: str
+    probe_ok: bool = True
 
     @property
     def account_summary(self) -> str | None:
@@ -122,6 +145,7 @@ class GitHubAuthState:
     git_protocol: str | None
     status_summary: str
     raw_status: str
+    probe_ok: bool = True
 
 
 @dataclass(slots=True)
@@ -179,6 +203,7 @@ class WhisperState:
     summary: str
     package_version: str | None = None
     details: str | None = None
+    probe_ok: bool = True
 
 
 @dataclass(slots=True)
@@ -198,6 +223,14 @@ class BotUpdateState:
     update_available: bool
     check_ok: bool
     status_summary: str
+
+
+@dataclass(slots=True)
+class WhisperRuntimeResolution:
+    executable: str | None
+    version: str | None
+    label: str | None
+    probe_ok: bool = True
 
 
 @dataclass(slots=True)
@@ -317,6 +350,12 @@ class CodexRunner:
 
         return platform_install_path.resolve(strict=False)
 
+    def _codex_execution_args(self) -> list[str]:
+        mode = normalize_codex_sandbox_mode(self.config.codex_sandbox_mode)
+        if mode == "danger-full-access":
+            return ["-a", "never", "-s", "danger-full-access"]
+        return ["--full-auto"]
+
     async def collect_codex_auth_state(self) -> CodexAuthState:
         cli_path = self.codex_path()
         cli_version = None
@@ -324,7 +363,7 @@ class CodexRunner:
             version_result = await self._run_process(
                 [self.config.codex_bin, "--version"],
                 cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
-                timeout=15,
+                timeout=STATUS_PROBE_TIMEOUT_SECONDS,
                 log_command=False,
             )
             if version_result.ok:
@@ -346,19 +385,23 @@ class CodexRunner:
         status_result = await self._run_process(
             [self.config.codex_bin, "login", "status"],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
-            timeout=15,
+            timeout=STATUS_PROBE_TIMEOUT_SECONDS,
             log_command=False,
         )
         raw_status = (status_result.stdout or status_result.stderr).strip()
         logged_in = status_result.ok and "logged in" in raw_status.lower()
+        probe_ok = not status_result.timed_out
 
         auth_mode, account_name, account_email = self._read_auth_file_metadata()
         provider = self._detect_auth_provider(raw_status, auth_mode)
-        status_summary = self._summarize_auth_status(
-            raw_status=raw_status,
-            logged_in=logged_in,
-            auth_provider=provider,
-        )
+        if status_result.timed_out:
+            status_summary = "Status check timed out"
+        else:
+            status_summary = self._summarize_auth_status(
+                raw_status=raw_status,
+                logged_in=logged_in,
+                auth_provider=provider,
+            )
 
         return CodexAuthState(
             cli_path=cli_path,
@@ -370,6 +413,7 @@ class CodexRunner:
             account_email=account_email,
             status_summary=status_summary,
             raw_status=raw_status,
+            probe_ok=probe_ok,
         )
 
     async def collect_github_auth_state(self) -> GitHubAuthState:
@@ -380,7 +424,7 @@ class CodexRunner:
             version_result = await self._run_process(
                 ["gh", "--version"],
                 cwd=cwd,
-                timeout=15,
+                timeout=STATUS_PROBE_TIMEOUT_SECONDS,
                 log_command=False,
             )
             if version_result.ok:
@@ -403,7 +447,7 @@ class CodexRunner:
         status_result = await self._run_process(
             ["gh", "auth", "status", "--json", "hosts"],
             cwd=cwd,
-            timeout=15,
+            timeout=STATUS_PROBE_TIMEOUT_SECONDS,
             log_command=False,
         )
         raw_status = (status_result.stdout or status_result.stderr).strip()
@@ -412,6 +456,7 @@ class CodexRunner:
         scopes = None
         git_protocol = None
         logged_in = False
+        probe_ok = not status_result.timed_out
 
         try:
             payload = json.loads(status_result.stdout or "{}")
@@ -440,11 +485,11 @@ class CodexRunner:
                 scopes = str(selected_entry.get("scopes") or "").strip() or None
                 git_protocol = str(selected_entry.get("gitProtocol") or "").strip() or None
 
-        if logged_in:
+        if logged_in and probe_ok:
             probe_result = await self._run_process(
                 ["gh", "api", "user", "-q", ".login"],
                 cwd=cwd,
-                timeout=20,
+                timeout=GITHUB_LIVE_PROBE_TIMEOUT_SECONDS,
                 log_command=False,
             )
             if probe_result.ok:
@@ -453,10 +498,13 @@ class CodexRunner:
                     login = live_login
             else:
                 logged_in = False
+                probe_ok = not probe_result.timed_out
                 probe_text = (probe_result.stderr or probe_result.stdout or "").strip()
                 raw_status = f"{raw_status}\n\nLive auth check failed:\n{probe_text}".strip()
 
-        if logged_in:
+        if not probe_ok:
+            status_summary = "Status check timed out"
+        elif logged_in:
             status_summary = f"Connected as {login}" if login else "Connected"
         else:
             status_summary = "Not connected"
@@ -472,6 +520,7 @@ class CodexRunner:
             git_protocol=git_protocol,
             status_summary=status_summary,
             raw_status=raw_status or "You are not logged into any GitHub hosts.",
+            probe_ok=probe_ok,
         )
 
     async def collect_bot_update_state(self) -> BotUpdateState:
@@ -516,8 +565,16 @@ class CodexRunner:
         )
 
     async def collect_whisper_state(self) -> WhisperState:
-        runtime_executable, version, runtime_label = await self._resolve_whisper_runtime()
-        if runtime_executable is None:
+        runtime = await self._resolve_whisper_runtime()
+        if runtime.executable is None:
+            if not runtime.probe_ok:
+                return WhisperState(
+                    installed=False,
+                    model_name=self.whisper_model_name(),
+                    summary="Status check timed out",
+                    details="Whisper runtime detection timed out. Try again from Settings.",
+                    probe_ok=False,
+                )
             return WhisperState(
                 installed=False,
                 model_name=self.whisper_model_name(),
@@ -526,13 +583,13 @@ class CodexRunner:
             )
 
         details = None
-        if runtime_executable != sys.executable:
-            details = f"Using external runtime: {runtime_label or runtime_executable}"
+        if runtime.executable != sys.executable:
+            details = f"Using external runtime: {runtime.label or runtime.executable}"
         return WhisperState(
             installed=True,
             model_name=self.whisper_model_name(),
             summary=f"Installed ({self.whisper_model_name()})",
-            package_version=version,
+            package_version=runtime.version,
             details=details,
         )
 
@@ -667,8 +724,8 @@ class CodexRunner:
         ]
 
     async def uninstall_whisper_runtime(self) -> CommandResult:
-        runtime_executable, _, _ = await self._resolve_whisper_runtime()
-        executable = runtime_executable or sys.executable
+        runtime = await self._resolve_whisper_runtime()
+        executable = runtime.executable or sys.executable
         return await self._run_process(
             [
                 executable,
@@ -815,8 +872,8 @@ class CodexRunner:
             )
             return VoiceTranscriptionResult(result=result, text="")
 
-        runtime_executable, _, _ = await self._resolve_whisper_runtime()
-        if runtime_executable is None:
+        runtime = await self._resolve_whisper_runtime()
+        if runtime.executable is None:
             result = self._synthetic_error_result(
                 [sys.executable, "-c", "transcribe"],
                 "Whisper is not installed. Open Settings and install it first.",
@@ -836,7 +893,7 @@ class CodexRunner:
             "print(json.dumps(payload, ensure_ascii=False))\n"
         )
         result = await self._run_process(
-            [runtime_executable, "-c", transcription_script, str(audio_path)],
+            [runtime.executable, "-c", transcription_script, str(audio_path)],
             cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
             timeout=900,
         )
@@ -854,13 +911,14 @@ class CodexRunner:
             language=str(payload["language"]) if payload.get("language") else None,
         )
 
-    async def _resolve_whisper_runtime(self) -> tuple[str | None, str | None, str | None]:
+    async def _resolve_whisper_runtime(self) -> WhisperRuntimeResolution:
         candidates: list[tuple[str, str]] = [(sys.executable, "bot environment")]
         system_python = shutil.which("python3")
         if system_python and Path(system_python).resolve(strict=False) != Path(sys.executable).resolve(strict=False):
             candidates.append((system_python, "system python3"))
 
         seen: set[str] = set()
+        probe_ok = True
         for executable, label in candidates:
             if executable in seen:
                 continue
@@ -875,13 +933,24 @@ class CodexRunner:
                     ),
                 ],
                 cwd=self.config.working_dir if self.config.working_dir_exists else Path.home(),
-                timeout=30,
+                timeout=WHISPER_RUNTIME_PROBE_TIMEOUT_SECONDS,
                 log_command=False,
             )
             if probe.ok:
-                return executable, probe.stdout.strip() or None, label
+                return WhisperRuntimeResolution(
+                    executable=executable,
+                    version=probe.stdout.strip() or None,
+                    label=label,
+                )
+            if probe.timed_out:
+                probe_ok = False
 
-        return None, None, None
+        return WhisperRuntimeResolution(
+            executable=None,
+            version=None,
+            label=None,
+            probe_ok=probe_ok,
+        )
 
     async def run_codex_prompt(self, prompt: str) -> CommandResult:
         prompt = prompt.strip()
@@ -909,11 +978,22 @@ class CodexRunner:
                 exit_code=127,
             )
 
-        return await self._run_process(
-            [self.config.codex_bin, "-m", self.config.codex_model, "-c", f'model_reasoning_effort="{self.config.codex_thinking_level}"', prompt],
-            cwd=self.config.working_dir,
-            timeout=self.config.command_timeout_seconds,
-        )
+        args = [
+            self.config.codex_bin,
+            *self._codex_execution_args(),
+            "exec",
+            "-m",
+            self.config.codex_model,
+            "-c",
+            f'model_reasoning_effort="{self.config.codex_thinking_level}"',
+            "--color",
+            "never",
+            "--skip-git-repo-check",
+            "-C",
+            str(self.config.working_dir),
+            prompt,
+        ]
+        return await self._run_process(args, cwd=self.config.working_dir, timeout=self.config.command_timeout_seconds)
 
     async def run_codex_streaming_prompt(
         self,
@@ -971,6 +1051,7 @@ class CodexRunner:
         output_file = Path(tempfile.gettempdir()) / f"ex-cod-tg-codex-last-{int(time.time() * 1000)}.txt"
         args = [
             self.config.codex_bin,
+            *self._codex_execution_args(),
             "exec",
             "-m",
             self.config.codex_model,
@@ -980,7 +1061,6 @@ class CodexRunner:
             "--color",
             "never",
             "--skip-git-repo-check",
-            "--full-auto",
             "-C",
             str(self.config.working_dir),
             "-o",
@@ -1161,7 +1241,7 @@ class CodexRunner:
     ) -> CodexStreamResult:
         args = [
             self.config.codex_bin,
-            "--full-auto",
+            *self._codex_execution_args(),
             "exec",
             "resume",
             "-c",
@@ -1438,10 +1518,12 @@ class CodexRunner:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(stdin_bytes), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
-            process.kill()
+            with suppress(ProcessLookupError):
+                process.kill()
             stdout_bytes, stderr_bytes = await process.communicate()
         except asyncio.CancelledError:
-            process.kill()
+            with suppress(ProcessLookupError):
+                process.kill()
             with suppress(ProcessLookupError):
                 await process.wait()
             raise

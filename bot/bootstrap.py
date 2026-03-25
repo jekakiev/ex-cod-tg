@@ -86,6 +86,7 @@ def prompt_for_config(existing: dict[str, str], *, default_working_dir: Path) ->
         "CODEX_MODEL": existing.get("CODEX_MODEL", "").strip() or "gpt-5.4",
         "CODEX_SELECTED_MODELS": existing.get("CODEX_SELECTED_MODELS", "").strip() or "gpt-5.4,gpt-5.4-mini",
         "CODEX_THINKING_LEVEL": existing.get("CODEX_THINKING_LEVEL", "").strip() or "high",
+        "CODEX_SANDBOX_MODE": existing.get("CODEX_SANDBOX_MODE", "").strip() or "workspace-write",
         "COMMAND_TIMEOUT_SECONDS": "900",
         "SHELL_TIMEOUT_SECONDS": "120",
         "GIT_TIMEOUT_SECONDS": "120",
