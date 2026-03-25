@@ -22,6 +22,7 @@ class BranchConversationState:
     branch_name: str
     session_id: str | None = None
     last_seen_head: str | None = None
+    codex_sandbox_mode: str | None = None
     summary: ConversationSummary | None = None
     updated_at: str | None = None
 
@@ -41,6 +42,7 @@ class BranchConversationStore:
         branch_name: str | None,
         session_id: str | None,
         last_seen_head: str | None,
+        codex_sandbox_mode: str | None,
         summary: ConversationSummary | None,
     ) -> BranchConversationState:
         state = BranchConversationState(
@@ -48,6 +50,7 @@ class BranchConversationStore:
             branch_name=normalize_branch_key(branch_name),
             session_id=session_id or None,
             last_seen_head=last_seen_head or None,
+            codex_sandbox_mode=codex_sandbox_mode or None,
             summary=summary,
             updated_at=_utc_now_iso(),
         )
@@ -97,6 +100,7 @@ class BranchConversationStore:
                 branch_name=branch_name,
                 session_id=str(item.get("session_id") or "").strip() or None,
                 last_seen_head=str(item.get("last_seen_head") or "").strip() or None,
+                codex_sandbox_mode=str(item.get("codex_sandbox_mode") or "").strip() or None,
                 summary=summary,
                 updated_at=str(item.get("updated_at") or "").strip() or None,
             )

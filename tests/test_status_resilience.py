@@ -119,7 +119,8 @@ def _install_aiogram_stub() -> None:
 
 _install_aiogram_stub()
 
-from bot.handlers import AppContext, AsyncCommandQueue, _get_auth_state
+from bot.conversation_store import BranchConversationState
+from bot.handlers import AppContext, AsyncCommandQueue, _can_resume_saved_session, _get_auth_state
 
 
 class _FakeProcess:
@@ -139,6 +140,17 @@ class _FakeProcess:
 
 
 class StatusResilienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_resume_is_disabled_when_sandbox_mode_changes(self) -> None:
+        saved_state = BranchConversationState(
+            repo_path="/tmp/repo",
+            branch_name="main",
+            session_id="session-1",
+            codex_sandbox_mode="workspace-write",
+        )
+
+        self.assertFalse(_can_resume_saved_session(saved_state, "danger-full-access"))
+        self.assertTrue(_can_resume_saved_session(saved_state, "workspace-write"))
+
     async def test_run_process_ignores_process_lookup_error_after_timeout(self) -> None:
         runner = CodexRunner(
             SimpleNamespace(

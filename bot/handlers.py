@@ -20,6 +20,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.chat_action import ChatActionSender
 
 from bot.codex_runner import (
+    DEFAULT_CODEX_SANDBOX_MODE,
     DEFAULT_REASONING_LEVELS,
     DEFAULT_SELECTED_MODELS,
     SUPPORTED_CODEX_SANDBOX_MODES,
@@ -2338,8 +2339,17 @@ def _persist_branch_conversation_state(
         branch_name=context.branch_name,
         session_id=session_id,
         last_seen_head=context.head_sha,
+        codex_sandbox_mode=normalize_codex_sandbox_mode(app_context.config.codex_sandbox_mode),
         summary=summary,
     )
+
+
+def _can_resume_saved_session(saved_state: BranchConversationState, current_sandbox_mode: str) -> bool:
+    if not saved_state.session_id:
+        return False
+    saved_mode = normalize_codex_sandbox_mode(saved_state.codex_sandbox_mode or DEFAULT_CODEX_SANDBOX_MODE)
+    current_mode = normalize_codex_sandbox_mode(current_sandbox_mode)
+    return saved_mode == current_mode
 
 
 async def _run_branch_scoped_codex_prompt(
@@ -2364,30 +2374,39 @@ async def _run_branch_scoped_codex_prompt(
         return result
 
     if saved_state is not None and saved_state.session_id:
-        result = await app_context.runner.run_codex_streaming_prompt(
-            prompt,
-            resume_session_id=saved_state.session_id,
-            on_update=on_update,
-        )
-        if result.result.ok:
-            _persist_branch_conversation_state(
-                app_context,
-                context=context,
-                prompt=prompt,
-                result=result,
-                session_id_override=result.session_id or saved_state.session_id,
+        if not _can_resume_saved_session(saved_state, app_context.config.codex_sandbox_mode):
+            logger.warning(
+                "Skipping resume for %s [%s] because sandbox mode changed from %s to %s.",
+                context.repo_path,
+                context.branch_label,
+                saved_state.codex_sandbox_mode or DEFAULT_CODEX_SANDBOX_MODE,
+                app_context.config.codex_sandbox_mode,
             )
-            return result
+        else:
+            result = await app_context.runner.run_codex_streaming_prompt(
+                prompt,
+                resume_session_id=saved_state.session_id,
+                on_update=on_update,
+            )
+            if result.result.ok:
+                _persist_branch_conversation_state(
+                    app_context,
+                    context=context,
+                    prompt=prompt,
+                    result=result,
+                    session_id_override=result.session_id or saved_state.session_id,
+                )
+                return result
 
-        error_text = result.result.stderr or result.result.stdout or ""
-        if not _looks_like_resume_session_failure(error_text):
-            return result
+            error_text = result.result.stderr or result.result.stdout or ""
+            if not _looks_like_resume_session_failure(error_text):
+                return result
 
-        logger.warning(
-            "Resume failed for %s [%s], falling back to a fresh session with saved summary.",
-            context.repo_path,
-            context.branch_label,
-        )
+            logger.warning(
+                "Resume failed for %s [%s], falling back to a fresh session with saved summary.",
+                context.repo_path,
+                context.branch_label,
+            )
 
     fresh_prompt = f"{context_prefix}{prompt}" if context_prefix else prompt
     fresh_result = await app_context.runner.run_codex_streaming_prompt(
