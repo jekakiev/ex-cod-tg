@@ -353,8 +353,16 @@ class CodexRunner:
     def _codex_execution_args(self) -> list[str]:
         mode = normalize_codex_sandbox_mode(self.config.codex_sandbox_mode)
         if mode == "danger-full-access":
-            return ["-a", "never", "-s", "danger-full-access"]
+            # Codex CLI 0.116.0 applies the full-access sandbox reliably only via
+            # exec-level flags, not when the sandbox flag is passed globally.
+            return ["--dangerously-bypass-approvals-and-sandbox"]
         return ["--full-auto"]
+
+    def _codex_exec_base_args(self) -> list[str]:
+        return [self.config.codex_bin, "exec", *self._codex_execution_args()]
+
+    def _codex_resume_base_args(self) -> list[str]:
+        return [self.config.codex_bin, "exec", "resume", *self._codex_execution_args()]
 
     async def collect_codex_auth_state(self) -> CodexAuthState:
         cli_path = self.codex_path()
@@ -979,9 +987,7 @@ class CodexRunner:
             )
 
         args = [
-            self.config.codex_bin,
-            *self._codex_execution_args(),
-            "exec",
+            *self._codex_exec_base_args(),
             "-m",
             self.config.codex_model,
             "-c",
@@ -1050,9 +1056,7 @@ class CodexRunner:
 
         output_file = Path(tempfile.gettempdir()) / f"ex-cod-tg-codex-last-{int(time.time() * 1000)}.txt"
         args = [
-            self.config.codex_bin,
-            *self._codex_execution_args(),
-            "exec",
+            *self._codex_exec_base_args(),
             "-m",
             self.config.codex_model,
             "-c",
@@ -1240,10 +1244,7 @@ class CodexRunner:
         on_update: Callable[[str], Awaitable[None]] | None,
     ) -> CodexStreamResult:
         args = [
-            self.config.codex_bin,
-            *self._codex_execution_args(),
-            "exec",
-            "resume",
+            *self._codex_resume_base_args(),
             "-c",
             f'model="{self.config.codex_model}"',
             "-c",

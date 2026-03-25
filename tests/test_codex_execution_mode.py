@@ -39,6 +39,30 @@ from bot.config import AppConfig
 
 
 class CodexExecutionModeTests(unittest.TestCase):
+    def _make_runner(self, sandbox_mode: str) -> CodexRunner:
+        return CodexRunner(
+            AppConfig(
+                telegram_bot_token="123456:ABCDEF_test_token",
+                admin_ids=frozenset(),
+                admin_labels={},
+                workspaces_root=Path.home(),
+                active_project_path=Path.home(),
+                codex_bin="codex",
+                codex_model="gpt-5.4",
+                codex_selected_models=("gpt-5.4",),
+                codex_thinking_level="high",
+                codex_sandbox_mode=sandbox_mode,
+                command_timeout_seconds=900,
+                shell_timeout_seconds=120,
+                git_timeout_seconds=120,
+                max_output_chars=20000,
+                telegram_max_images_per_request=10,
+                telegram_image_max_bytes=20 * 1024 * 1024,
+                config_file=Path("/tmp/config.env"),
+                project_root=Path("/tmp/project"),
+            )
+        )
+
     def test_normalize_codex_sandbox_mode_aliases(self) -> None:
         self.assertEqual(normalize_codex_sandbox_mode("workspace"), "workspace-write")
         self.assertEqual(normalize_codex_sandbox_mode("danger"), "danger-full-access")
@@ -62,56 +86,22 @@ class CodexExecutionModeTests(unittest.TestCase):
         self.assertEqual(config.codex_sandbox_mode, "danger-full-access")
 
     def test_runner_uses_full_access_args_for_danger_mode(self) -> None:
-        runner = CodexRunner(
-            AppConfig(
-                telegram_bot_token="123456:ABCDEF_test_token",
-                admin_ids=frozenset(),
-                admin_labels={},
-                workspaces_root=Path.home(),
-                active_project_path=Path.home(),
-                codex_bin="codex",
-                codex_model="gpt-5.4",
-                codex_selected_models=("gpt-5.4",),
-                codex_thinking_level="high",
-                codex_sandbox_mode="danger-full-access",
-                command_timeout_seconds=900,
-                shell_timeout_seconds=120,
-                git_timeout_seconds=120,
-                max_output_chars=20000,
-                telegram_max_images_per_request=10,
-                telegram_image_max_bytes=20 * 1024 * 1024,
-                config_file=Path("/tmp/config.env"),
-                project_root=Path("/tmp/project"),
-            )
+        runner = self._make_runner("danger-full-access")
+        self.assertEqual(runner._codex_execution_args(), ["--dangerously-bypass-approvals-and-sandbox"])
+        self.assertEqual(
+            runner._codex_exec_base_args(),
+            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
         )
-
-        self.assertEqual(runner._codex_execution_args(), ["-a", "never", "-s", "danger-full-access"])
+        self.assertEqual(
+            runner._codex_resume_base_args(),
+            ["codex", "exec", "resume", "--dangerously-bypass-approvals-and-sandbox"],
+        )
 
     def test_runner_uses_full_auto_for_workspace_write(self) -> None:
-        runner = CodexRunner(
-            AppConfig(
-                telegram_bot_token="123456:ABCDEF_test_token",
-                admin_ids=frozenset(),
-                admin_labels={},
-                workspaces_root=Path.home(),
-                active_project_path=Path.home(),
-                codex_bin="codex",
-                codex_model="gpt-5.4",
-                codex_selected_models=("gpt-5.4",),
-                codex_thinking_level="high",
-                codex_sandbox_mode="workspace-write",
-                command_timeout_seconds=900,
-                shell_timeout_seconds=120,
-                git_timeout_seconds=120,
-                max_output_chars=20000,
-                telegram_max_images_per_request=10,
-                telegram_image_max_bytes=20 * 1024 * 1024,
-                config_file=Path("/tmp/config.env"),
-                project_root=Path("/tmp/project"),
-            )
-        )
-
+        runner = self._make_runner("workspace-write")
         self.assertEqual(runner._codex_execution_args(), ["--full-auto"])
+        self.assertEqual(runner._codex_exec_base_args(), ["codex", "exec", "--full-auto"])
+        self.assertEqual(runner._codex_resume_base_args(), ["codex", "exec", "resume", "--full-auto"])
 
 
 if __name__ == "__main__":
