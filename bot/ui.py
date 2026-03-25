@@ -712,7 +712,7 @@ def response_controls_keyboard(*, current_model: str, current_thinking_level: st
                     callback_data="quick:thinking",
                 ),
             ],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="nav:main_menu")],
+            [InlineKeyboardButton(text="Go Home", callback_data="nav:main_menu")],
         ]
     )
 
